@@ -1,0 +1,15 @@
+{
+  "name": "ai-afp-usage",
+  "private": true,
+  "version": "0.1.0",
+  "description": "火山方舟 Agent Plan AFP 用量查看器",
+  "license": "MIT",
+  "scripts": {
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

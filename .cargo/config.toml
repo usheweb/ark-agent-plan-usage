@@ -1,0 +1,6 @@
+# 项目级 cargo 配置：仅对本项目生效，不改动 ~/.cargo/config.toml。
+# 原因：全局配置里 replace-with = "aliyun" 指向的 USTC git index 已返回 404，
+# 导致依赖无法拉取。这里改用 USTC 的 sparse index（已实测可达）。
+# 注意：不能替换成官方 index.crates.io —— cargo 不允许「用 crates.io 替换 crates.io」。
+[source.aliyun]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"

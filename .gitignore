@@ -1,0 +1,21 @@
+# 本地凭证（切勿提交到仓库）
+.env
+.env.*
+!.env.example
+
+# Rust / Tauri 构建产物
+/src-tauri/target/
+/src-tauri/gen/
+
+# 打包产物
+*.app/
+
+# Node（CI 里 npm install 生成）
+node_modules/
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/

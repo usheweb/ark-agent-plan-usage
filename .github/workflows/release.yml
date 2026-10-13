@@ -1,0 +1,75 @@
+name: Release
+
+# 推 v* 标签（如 v0.1.0）自动打包各平台安装包并上传到 Release；
+# 也可以在 Actions 页面手动触发（workflow_dispatch）来试跑。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS 通用包：一个 dmg 同时支持 Intel 与 M 系列芯片
+          - platform: macos-latest
+            label: macOS universal
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            args: --target universal-apple-darwin
+
+          # Windows 64 位：输出 NSIS 安装包（*_x64-setup.exe）
+          - platform: windows-latest
+            label: Windows x64
+            rust-targets: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+    name: ${{ matrix.label }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 本项目 UI 是纯静态文件（ui/），没有前端构建步骤；
+      # 这里装依赖只是为了给 tauri-action 提供 @tauri-apps/cli（npm run tauri）。
+      - name: Install frontend deps
+        run: npm install
+
+      - name: Build and upload to Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 火山方舟 AFP 用量 v__VERSION__
+          releaseBody: |
+            火山方舟 Agent Plan AFP 用量查看器 v__VERSION__。
+
+            下载对应平台安装包即可：
+            - Windows：`*_x64-setup.exe`（双击安装）
+            - macOS：通用 dmg，同时支持 Intel 与 Apple 芯片
+
+            首次启动后在界面右上角「设置」里填入火山引擎 Access Key / Secret Key 即可使用。
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

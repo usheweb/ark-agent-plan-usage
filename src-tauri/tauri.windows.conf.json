@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "火山方舟 AFP 用量",
+        "width": 420,
+        "height": 500,
+        "minWidth": 380,
+        "minHeight": 480,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["nsis"]
+  }
+}
