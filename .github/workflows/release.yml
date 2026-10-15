@@ -73,8 +73,10 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: 唐三浪悬浮窗 v__VERSION__
-          # [version] [arch] [setup] [ext] 由 tauri-action 按产物填充；[setup] 仅 nsis 安装包有值
-          releaseAssetNamePattern: ${{ steps.asset-prefix.outputs.prefix }}_[version]_[arch][setup][ext]
+          # 注意：tauri-action@v0 的输入名是 assetNamePattern
+          # （dev 分支已改名为 releaseAssetNamePattern，升级时需同步）
+          # [version] [arch] [setup] [ext] 由 action 按产物填充；[setup] 仅 nsis 安装包有值
+          assetNamePattern: ${{ steps.asset-prefix.outputs.prefix }}_[version]_[arch][setup][ext]
           releaseBody: |
             唐三浪悬浮窗 v__VERSION__：把各个 AI 服务商的余额 / 用量聚合在一个悬浮窗里。
 
