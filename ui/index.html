@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>火山方舟 AFP 用量</title>
+    <title>唐三浪悬浮窗</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -12,15 +12,13 @@
     <header class="topbar" data-tauri-drag-region="deep">
       <div class="topbar-inner">
         <div class="brand">
-          <div class="brand-dot"></div>
           <div class="brand-text">
-            <h1>火山方舟 AFP 用量</h1>
-            <p id="subtitle">Agent Plan 套餐额度</p>
+            <h1>唐三浪悬浮窗</h1>
+            <p id="subtitle">—</p>
           </div>
         </div>
         <div class="topbar-actions">
-          <span class="plan-badge" id="plan-badge">—</span>
-          <button class="icon-btn" id="settings-btn" title="设置火山引擎 Access Key">
+          <button class="icon-btn" id="settings-btn" title="设置数据源">
             <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
               <path
                 d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"
@@ -55,12 +53,20 @@
       </div>
     </header>
 
+    <!-- 场景 Tab：只列已配置的平台，点击切换当前展示的场景；悬浮态整体隐藏 -->
+    <nav class="tabs hidden" id="scenario-tabs"></nav>
+
     <main class="content">
       <div class="status-bar">
         <span id="status-dot" class="status-dot"></span>
         <span id="status-text">正在加载…</span>
+        <span class="plan-badge" id="plan-badge">—</span>
         <span class="spacer"></span>
         <span id="countdown" class="countdown"></span>
+        <!-- 锁定态常驻入口：任何场景都能点它去读取钥匙串里的密钥 -->
+        <button class="link-btn hidden" id="connect-sm" type="button" title="连接账号：读取系统钥匙串中已保存的密钥">
+          连接账号
+        </button>
         <button class="pin-btn" id="pin-btn" title="定住为悬浮窗，总在最前">
           <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
             <path
@@ -78,8 +84,8 @@
     </main>
 
     <section id="float" class="float">
-      <div class="float-card" data-tauri-drag-region="deep">
-        <div class="float-ring">
+      <div class="float-card" id="float-card" data-tauri-drag-region="deep">
+        <div class="float-ring" id="float-ring">
           <svg width="52" height="52" viewBox="0 0 52 52">
             <circle class="float-ring-bg" cx="26" cy="26" r="20" fill="none" stroke-width="6" />
             <circle
@@ -95,11 +101,16 @@
               stroke-dashoffset="125.66"
             />
           </svg>
+          <!-- 环内百分比：与展开视图的圆环口径一致（已用占比），无占比的场景不显示 -->
+          <div class="float-ring-pct" id="float-ring-pct"></div>
         </div>
         <div class="float-info">
-          <div class="float-label">近 5 小时剩余</div>
+          <div class="float-label">
+            <span id="float-label">—</span>
+            <span class="float-reset" id="float-reset">—</span>
+          </div>
           <div class="float-remain">
-            <span id="float-remain">—</span><span class="float-unit">AFP</span>
+            <span id="float-remain">—</span><span class="float-unit" id="float-unit"></span>
           </div>
           <div class="float-sub" id="float-sub">正在加载…</div>
         </div>
@@ -111,42 +122,54 @@
       <div class="modal-backdrop" id="settings-backdrop"></div>
       <div class="modal-card">
         <div class="modal-head">
-          <h2>设置火山引擎凭证</h2>
+          <h2 id="settings-title">数据源</h2>
           <button class="icon-btn" id="settings-close" title="关闭">×</button>
         </div>
-        <p class="modal-desc">
-          仅保存在本机（<code id="creds-path">应用配置目录</code>），用于调用方舟 GetAFPUsage 接口；换机器或发布项目都不需要 <code>.env</code>。
-        </p>
 
-        <label class="field">
-          <span class="field-label">Access Key</span>
-          <input id="ak-input" type="text" spellcheck="false" autocomplete="off" placeholder="AKLT..." />
-        </label>
-
-        <label class="field">
-          <span class="field-label">Secret Key</span>
-          <span class="field-row">
-            <input id="sk-input" type="password" spellcheck="false" autocomplete="off" placeholder="请填写 Secret Key" />
-            <button class="ghost-btn" id="sk-toggle" type="button">显示</button>
-          </span>
-        </label>
-
-        <div class="modal-link">
-          <a id="key-help" href="#">打开火山引擎密钥管理页 →</a>
+        <!-- 视图一：数据源列表 -->
+        <div id="settings-list-view">
+          <p class="modal-desc" id="storage-desc"></p>
+          <div id="source-list" class="source-list"></div>
         </div>
 
-        <div id="settings-msg" class="settings-msg hidden"></div>
+        <!-- 视图二：某个平台的凭证表单（字段由后端下发的 schema 动态生成） -->
+        <div id="settings-detail-view" class="hidden">
+          <p class="modal-desc" id="detail-desc"></p>
+          <div id="detail-fields"></div>
 
-        <div class="modal-foot">
-          <button class="ghost-btn danger" id="settings-clear" type="button">清除本机凭证</button>
-          <span class="spacer"></span>
-          <button class="ghost-btn" id="settings-cancel" type="button">取消</button>
-          <button class="ghost-btn" id="settings-test" type="button">测试连接</button>
-          <button class="primary-btn" id="settings-save" type="button">保存</button>
+          <!-- 刷新间隔不属于凭证，单独渲染：按场景各自保存（E-02） -->
+          <div class="field">
+            <span class="field-label">自动刷新间隔（秒）</span>
+            <input
+              id="detail-interval"
+              type="number"
+              min="5"
+              max="3600"
+              step="5"
+              inputmode="numeric"
+              autocomplete="off"
+            />
+          </div>
+
+          <div id="settings-msg" class="settings-msg hidden"></div>
+
+          <div class="modal-foot">
+            <button class="ghost-btn" id="detail-back" type="button">返回</button>
+            <button class="ghost-btn danger" id="detail-clear" type="button">清除本机凭证</button>
+            <span class="spacer"></span>
+            <button class="ghost-btn" id="detail-test" type="button">测试连接</button>
+            <button class="primary-btn" id="detail-save" type="button">保存并切换</button>
+          </div>
         </div>
       </div>
     </div>
 
+    <script src="util.js"></script>
+    <script src="sources/volcengine.js"></script>
+    <script src="sources/deepseek.js"></script>
+    <script src="sources/kimi.js"></script>
+    <script src="sources/siliconflow.js"></script>
+    <script src="sources/trae.js"></script>
     <script src="main.js"></script>
   </body>
 </html>

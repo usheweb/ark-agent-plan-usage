@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AFP用量",
-  "version": "0.1.0",
-  "identifier": "com.usheai.afpusage",
+  "productName": "唐三浪悬浮窗",
+  "version": "0.2.0",
+  "identifier": "com.tangsanlang.floating",
   "build": {
     "frontendDist": "../ui"
   },
@@ -12,7 +12,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "火山方舟 AFP 用量",
+        "title": "唐三浪悬浮窗",
         "width": 420,
         "height": 500,
         "minWidth": 380,

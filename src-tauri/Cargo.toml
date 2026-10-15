@@ -1,10 +1,11 @@
 [package]
 name = "ai-afp-usage"
-version = "0.1.0"
+version = "0.2.0"
 description = "火山方舟 Agent Plan AFP 用量查看器"
 authors = ["ushe-ai"]
 edition = "2021"
-rust-version = "1.77"
+# keyring 4.x 要求 rustc ≥ 1.88
+rust-version = "1.88"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -17,7 +18,13 @@ reqwest = { version = "0.12", features = ["json"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# Trae Code 积分：解密本机 Trae CN 登录态（byteCrypto 自研格式，AES-128-CBC + SHA-512 KDF）
+aes = "0.8"
+cbc = "0.1"
+base64 = "0.22"
 chrono = "0.4"
+# 凭证存系统钥匙串（macOS Keychain / Windows 凭据管理器），见待办 E-01
+keyring = "4"
 
 [profile.release]
 codegen-units = 1
