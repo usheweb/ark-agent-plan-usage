@@ -55,6 +55,17 @@ jobs:
       - name: Install frontend deps
         run: npm install
 
+      # 资产名默认直接沿用产品名，而产品名是纯中文，GitHub 会把非 ASCII 字符剥掉、
+      # 只剩前导下划线（如 _0.2.0_universal.dmg）。这里改成
+      # 「包名(identifier)最后一段 + 版本 + 架构」命名，例如 floating_0.2.0_universal.dmg。
+      - name: Resolve asset prefix
+        id: asset-prefix
+        shell: bash
+        run: |
+          prefix=$(node -p "require('./src-tauri/tauri.conf.json').identifier.split('.').pop()")
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "资产名前缀：$prefix"
+
       - name: Build and upload to Release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -62,6 +73,8 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: 唐三浪悬浮窗 v__VERSION__
+          # [version] [arch] [setup] [ext] 由 tauri-action 按产物填充；[setup] 仅 nsis 安装包有值
+          releaseAssetNamePattern: ${{ steps.asset-prefix.outputs.prefix }}_[version]_[arch][setup][ext]
           releaseBody: |
             唐三浪悬浮窗 v__VERSION__：把各个 AI 服务商的余额 / 用量聚合在一个悬浮窗里。
 
