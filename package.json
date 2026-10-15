@@ -1,7 +1,7 @@
 {
   "name": "ark-agent-plan-usage",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "火山方舟 Agent Plan 余量查看器：实时显示方舟 Agent Plan 剩余用量，支持悬浮窗常驻显示，只需配置一次方舟 Key",
   "license": "MIT",
   "scripts": {
