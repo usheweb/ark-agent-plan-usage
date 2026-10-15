@@ -695,21 +695,36 @@ el.pinBtn.addEventListener("click", () => setPinned(true));
 el.floatClose.addEventListener("click", () => setPinned(false));
 
 // 悬浮窗整卡可点：点一下立刻重取数据（锁定态且需钥匙串则先走解锁）。
-// 卡片同时是拖拽区，拖动时浏览器可能补一个 click，所以按下位置位移超过 6px 就当成拖拽，不刷新。
+// 卡片同时是原生拖拽区，拖完系统会补一个 click，所以要按位移把拖拽排掉。
+// 这里必须用屏幕绝对坐标 e.screenX/e.screenY：拖拽时窗口跟着指针一起走，
+// 指针相对窗口的 clientX/clientY 几乎不变，只有屏幕坐标才反映真实位移。
 let floatDown = null;
 el.floatCard.addEventListener("pointerdown", (e) => {
-  floatDown = { x: e.clientX, y: e.clientY };
+  if (e.button !== 0) return;
+  floatDown = { x: e.screenX, y: e.screenY };
+});
+el.floatCard.addEventListener("pointercancel", () => {
+  floatDown = null;
 });
 el.floatCard.addEventListener("click", (e) => {
   if (e.target.closest(".float-close")) return;
-  if (floatDown && Math.hypot(e.clientX - floatDown.x, e.clientY - floatDown.y) > 6) {
-    floatDown = null;
-    return;
-  }
+  const moved =
+    floatDown && Math.hypot(e.screenX - floatDown.x, e.screenY - floatDown.y) > 6;
   floatDown = null;
+  if (moved) return;
   if (lockedScene) connectAccount();
   else refresh(true);
 });
+
+// 悬浮卡片右键菜单：由 Rust 弹系统原生菜单（网页里自绘会被这么小的窗口裁掉），
+// 菜单项「关闭悬浮窗」走 menu-unpin 事件回到 setPinned，「退出软件」由 Rust 直接退出。
+// 这里 preventDefault 才不会再弹出 WebView 自带的 Reload 菜单。
+el.floatCard.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  invoke("show_card_menu").catch(() => {});
+});
+
+window.__TAURI__.event.listen("menu-unpin", () => setPinned(false));
 
 // 倒计时每秒走一格；自动刷新定时器由 applyRefreshInterval 按当前场景的间隔维护
 setInterval(() => {
@@ -736,4 +751,22 @@ async function bootstrap() {
   }
 }
 
-bootstrap();
+// 启动流程：窗口以 visible:false 创建（否则会先闪一下主界面大窗、悬浮态很穿帮）。
+// 先问 Rust 上次是不是定住态，在窗口还隐藏着的时候就把布局切成对应的形态，再显示，最后才开始取数。
+(async () => {
+  let pinnedAtStart = false;
+  try {
+    const st = await invoke("startup_state");
+    pinnedAtStart = !!st.pinned;
+    document.body.classList.toggle("pinned", pinnedAtStart);
+    if (pinnedAtStart) updateFloat();
+  } catch (_) {
+    /* 拿不到状态就按主界面显示 */
+  }
+  try {
+    await invoke("show_window");
+  } catch (_) {
+    /* 显示失败也有 Rust 侧 3 秒兜底 */
+  }
+  bootstrap();
+})();

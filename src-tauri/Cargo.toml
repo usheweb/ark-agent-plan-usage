@@ -1,6 +1,6 @@
 [package]
 name = "ai-afp-usage"
-version = "0.2.0"
+version = "0.2.1"
 description = "火山方舟 Agent Plan AFP 用量查看器"
 authors = ["ushe-ai"]
 edition = "2021"

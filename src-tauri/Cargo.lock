@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "ai-afp-usage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",

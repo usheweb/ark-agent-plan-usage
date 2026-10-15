@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use hmac::{Hmac, Mac};
@@ -1423,22 +1424,40 @@ const COMPACT_MIN_H: f64 = 90.0;
 const ANIM_MS: u64 = 180;
 const ANIM_FRAME_MS: u64 = 8;
 
-/// 悬浮窗（定住态）上次摆放的物理坐标：点击「取消定住」时记录，下次定住时还原。
-/// 仅内存态，不跨进程持久化。
-static FLOAT_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// 悬浮窗（定住态）上次摆放的物理坐标与「是否定住」都存在 settings.json 里，
+/// 跨进程保留：下次启动直接回到退出时那个悬浮窗，而不是回到主界面。
+/// 仅内存态没法满足「退出软件后下次回到悬浮窗」的需求，所以落盘（不含任何密钥）。
+static PINNED: AtomicBool = AtomicBool::new(false);
+
+/// 写入「定住」状态与悬浮窗坐标（`pos` 为 None 时保留原有的坐标）
+fn persist_pin_state(app: &tauri::AppHandle, pinned: bool, pos: Option<(i32, i32)>) {
+    let mut settings = read_settings(app);
+    settings["pinned"] = serde_json::json!(pinned);
+    if let Some((x, y)) = pos {
+        settings["floatPos"] = serde_json::json!({ "x": x, "y": y });
+    }
+    let _ = write_settings(app, &settings);
+}
+
+/// 上次是否处于「定住」态
+fn saved_pinned(app: &tauri::AppHandle) -> bool {
+    read_settings(app)
+        .get("pinned")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// 上次悬浮窗摆放的物理坐标
+fn saved_float_pos(app: &tauri::AppHandle) -> Option<(i32, i32)> {
+    let settings = read_settings(app);
+    let p = settings.get("floatPos")?;
+    Some((p.get("x")?.as_i64()? as i32, p.get("y")?.as_i64()? as i32))
+}
 
 /// 记录悬浮窗当前位置（在窗口仍为悬浮尺寸时调用）。
 fn save_float_pos(window: &tauri::WebviewWindow) {
-    if let Ok(pos) = window.outer_position() {
-        if let Ok(mut slot) = FLOAT_POS.lock() {
-            *slot = Some((pos.x, pos.y));
-        }
-    }
-}
-
-/// 读取上次记录的悬浮窗位置。
-fn saved_float_pos() -> Option<(i32, i32)> {
-    FLOAT_POS.lock().ok().and_then(|slot| *slot)
+    let pos = window.outer_position().ok().map(|p| (p.x, p.y));
+    persist_pin_state(window.app_handle(), false, pos);
 }
 
 /// 把目标外框左上角约束到当前显示器工作区（已扣除菜单栏 / Dock / 任务栏）。
@@ -1521,27 +1540,44 @@ fn animate_rect(window: &tauri::WebviewWindow, to_pos: (i32, i32), to_size: (u32
     let _ = window.set_position(tauri::PhysicalPosition::new(to_pos.0, to_pos.1));
 }
 
+/// 置为「定住」形态：小尺寸下限、不可缩放、无边框、置顶、无阴影。
+/// 启动恢复与手动点「定住」共用，启动时不走动画。
+fn apply_pinned_style(window: &tauri::WebviewWindow) -> Result<(), String> {
+    window
+        .set_min_size(Some(tauri::LogicalSize::new(COMPACT_MIN_W, COMPACT_MIN_H)))
+        .map_err(|e| e.to_string())?;
+    window.set_resizable(false).map_err(|e| e.to_string())?;
+    window.set_always_on_top(true).map_err(|e| e.to_string())?;
+    window.set_decorations(false).map_err(|e| e.to_string())?;
+    // 关闭 macOS 原生窗口阴影：透明窗口下它会在悬浮卡片四周的透明区域里投出一圈灰色阴影
+    window.set_shadow(false).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 计算「定住」后的目标矩形：尺寸固定为悬浮尺寸，位置优先还原上次摆放处，否则沿用当前坐标。
+fn pinned_target(window: &tauri::WebviewWindow) -> ((i32, i32), (u32, u32)) {
+    let target_size = physical_size(window, COMPACT_W, COMPACT_H);
+    let cur = window.outer_position().map(|p| (p.x, p.y)).unwrap_or((0, 0));
+    let pos = clamped_pos(window, saved_float_pos(window.app_handle()).unwrap_or(cur), target_size);
+    (pos, target_size)
+}
+
 /// 切换「定住」悬浮窗模式：缩小窗口、无边框、置顶。
 #[tauri::command]
 async fn set_pinned(window: tauri::WebviewWindow, on: bool) -> Result<(), String> {
     if on {
-        window
-            .set_min_size(Some(tauri::LogicalSize::new(COMPACT_MIN_W, COMPACT_MIN_H)))
-            .map_err(|e| e.to_string())?;
-        window.set_resizable(false).map_err(|e| e.to_string())?;
-        window.set_always_on_top(true).map_err(|e| e.to_string())?;
-        window.set_decorations(false).map_err(|e| e.to_string())?;
-        // 关闭 macOS 原生窗口阴影：透明窗口下它会在悬浮卡片四周的透明区域里投出一圈灰色阴影
-        window.set_shadow(false).map_err(|e| e.to_string())?;
+        apply_pinned_style(&window)?;
 
-        // 提前算好最终落点：尺寸固定为悬浮尺寸；位置优先还原上次摆放处，否则沿用当前坐标。
-        let target_size = physical_size(&window, COMPACT_W, COMPACT_H);
-        let cur = window.outer_position().map(|p| (p.x, p.y)).unwrap_or((0, 0));
-        let target_pos = clamped_pos(&window, saved_float_pos().unwrap_or(cur), target_size);
+        // 提前算好最终落点
+        let (target_pos, target_size) = pinned_target(&window);
 
         // 先让前端切到悬浮布局，再动画，保证收缩过程里展示的就是悬浮卡片
         let _ = window.emit("pin-state", true);
         animate_rect(&window, target_pos, target_size);
+
+        // 记住「已定住」与当前坐标：中途直接退出软件也能回到这里
+        PINNED.store(true, Ordering::Relaxed);
+        persist_pin_state(window.app_handle(), true, Some(target_pos));
 
         // 定住期间拦截 Win+D / Win+M，避免悬浮窗被一并隐藏
         #[cfg(target_os = "windows")]
@@ -1549,6 +1585,7 @@ async fn set_pinned(window: tauri::WebviewWindow, on: bool) -> Result<(), String
     } else {
         // 在窗口仍为悬浮尺寸时记录当前位置，供下次定住时还原
         save_float_pos(&window);
+        PINNED.store(false, Ordering::Relaxed);
         #[cfg(target_os = "windows")]
         float_guard::set_active(false);
         window.set_always_on_top(false).map_err(|e| e.to_string())?;
@@ -1604,22 +1641,92 @@ async fn set_pinned(window: tauri::WebviewWindow, on: bool) -> Result<(), String
     Ok(())
 }
 
+/* ---------- 悬浮卡片右键菜单 ---------- */
+
+/// 悬浮卡片右键菜单的两个菜单项 id
+const CARD_MENU_UNPIN: &str = "card-unpin";
+const CARD_MENU_QUIT: &str = "card-quit";
+
+/// 弹出悬浮卡片的右键菜单。菜单由系统绘制，因此可以超出悬浮窗这个极小的窗口边界
+/// （在网页里自绘菜单会被窗口裁掉）。
+/// 「关闭悬浮窗」发回前端走 set_pinned，与卡片上的 × 同一条路径；
+/// 「退出软件」直接退出——退出前会由 run 回调把定住状态与坐标落盘。
+#[tauri::command]
+async fn show_card_menu(window: tauri::WebviewWindow) -> Result<(), String> {
+    let menu = tauri::menu::MenuBuilder::new(&window)
+        .text(CARD_MENU_UNPIN, "关闭悬浮窗")
+        .text(CARD_MENU_QUIT, "退出软件")
+        .build()
+        .map_err(|e| e.to_string())?;
+    window.popup_menu(&menu).map_err(|e| e.to_string())
+}
+
+/// 启动时前端来问「上次是不是定住态」：窗口在 setup 里已按定住形态摆好，
+/// 前端据此在窗口还隐藏时就把布局切成悬浮卡片，再调 show_window，避免主界面闪一下。
+#[tauri::command]
+fn startup_state(app: tauri::AppHandle) -> serde_json::Value {
+    serde_json::json!({ "pinned": saved_pinned(&app) })
+}
+
+/// 显示主窗口。窗口以 visible:false 创建，等前端把布局（主界面 / 悬浮卡片）切好再显示。
+#[tauri::command]
+fn show_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.show().map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
-        .setup(|_app| {
+        .setup(|app| {
             // 启动阶段零钥匙串访问：两次一次性迁移（明文→钥匙串、遗留服务名迁移）
             // 已挪到「连接账号」解锁流程里执行，见 unlock_credentials。
 
             // Windows：子类化主窗口过程，为「定住」悬浮窗保留防最小化的能力
             #[cfg(target_os = "windows")]
             {
-                if let Some(win) = _app.get_webview_window("main") {
+                if let Some(win) = app.get_webview_window("main") {
                     if let Ok(hwnd) = win.hwnd() {
                         float_guard::install(hwnd.0);
                     }
                 }
             }
+
+            let Some(win) = app.get_webview_window("main") else {
+                return Ok(());
+            };
+
+            // 上次是定住态：窗口还隐藏着，先把悬浮形态与坐标摆好（不走动画，否则会有一次无意义的缩放）
+            if saved_pinned(app.handle()) {
+                PINNED.store(true, Ordering::Relaxed);
+                if let Err(e) = apply_pinned_style(&win) {
+                    eprintln!("恢复悬浮窗失败：{e}");
+                }
+                let (pos, size) = pinned_target(&win);
+                let _ = win.set_size(tauri::PhysicalSize::new(size.0, size.1));
+                let _ = win.set_position(tauri::PhysicalPosition::new(pos.0, pos.1));
+                #[cfg(target_os = "windows")]
+                float_guard::set_active(true);
+            }
+
+            // 兜底：前端若没能调 show_window（脚本出错），3 秒后强制显示，
+            // 免得出现「一个窗口都没有、只能去活动监视器杀进程」的死局。
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                if let Some(w) = handle.get_webview_window("main") {
+                    if !w.is_visible().unwrap_or(true) {
+                        let _ = w.show();
+                    }
+                }
+            });
+
             Ok(())
+        })
+        .on_menu_event(|app, event| match event.id().0.as_str() {
+            CARD_MENU_UNPIN => {
+                let _ = app.emit("menu-unpin", ());
+            }
+            CARD_MENU_QUIT => app.exit(0),
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             list_sources,
@@ -1631,10 +1738,25 @@ fn main() {
             test_source,
             unlock_credentials,
             open_url,
-            set_pinned
+            set_pinned,
+            show_card_menu,
+            startup_state,
+            show_window
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // 退出前落盘：定住态下把「当前」坐标存下来，下次启动才能回到退出时那一刻的位置
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if PINNED.load(Ordering::Relaxed) {
+                    let pos = app
+                        .get_webview_window("main")
+                        .and_then(|w| w.outer_position().ok())
+                        .map(|p| (p.x, p.y));
+                    persist_pin_state(app, true, pos);
+                }
+            }
+        });
 }
 
 #[cfg(test)]
