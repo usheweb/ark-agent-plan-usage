@@ -2,7 +2,7 @@
   "name": "tangsanlang-float",
   "private": true,
   "version": "0.2.1",
-  "description": "火山方舟 Agent Plan 余量查看器：实时显示方舟 Agent Plan 剩余用量，支持悬浮窗常驻显示，只需配置一次方舟 Key",
+  "description": "把各 AI 服务商的余额 / 用量聚合在一个常驻悬浮窗里：Trae 积分、火山方舟 Agent Plan、DeepSeek、Kimi 月之暗面、硅基流动",
   "license": "MIT",
   "scripts": {
     "tauri": "tauri",

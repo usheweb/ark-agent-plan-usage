@@ -1,7 +1,7 @@
 [package]
 name = "ai-afp-usage"
 version = "0.2.1"
-description = "火山方舟 Agent Plan AFP 用量查看器"
+description = "把各 AI 服务商的余额 / 用量聚合在一个常驻悬浮窗里"
 authors = ["ushe-ai"]
 edition = "2021"
 # keyring 4.x 要求 rustc ≥ 1.88
