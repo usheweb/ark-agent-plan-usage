@@ -96,10 +96,12 @@ function setStatus(kind, text) {
 function showError(msg) {
   el.error.textContent = msg;
   el.error.classList.remove("hidden");
+  fitWindowHeight();
 }
 
 function hideError() {
   el.error.classList.add("hidden");
+  fitWindowHeight();
 }
 
 /* ---------- 悬浮窗 ---------- */
@@ -191,6 +193,46 @@ async function fitFloatWidth(force = false) {
     await invoke("set_float_width", { width: w });
   } catch (_) {
     /* 改不动尺寸不影响内容展示，保持原宽度即可 */
+  }
+}
+
+/* ---------- 窗口高度贴合内容 ---------- */
+
+/// 量出主视图内容的「贴合高度」（逻辑像素）：顶栏 + Tab 条 + 内容区实际内容。
+/// 内容区取最后一个可见子元素的位置 + 高度再加下内边距，元素间的外边距
+/// 天然包含在 offsetTop 里，比逐项累加更稳。
+function measureContentHeight() {
+  const topbar = document.querySelector(".topbar");
+  const tabsH = el.tabs.classList.contains("hidden") ? 0 : el.tabs.offsetHeight;
+  const content = document.querySelector(".content");
+  const kids = [...content.children].filter((c) => !c.classList.contains("hidden"));
+  const last = kids[kids.length - 1];
+  if (!last) return topbar.offsetHeight + tabsH + content.offsetHeight;
+  const padBottom = parseFloat(getComputedStyle(content).paddingBottom) || 0;
+  return topbar.offsetHeight + tabsH + last.offsetTop + last.offsetHeight + padBottom;
+}
+
+/// 上次应用到窗口的高度（逻辑像素），用来抑制数字位数 / 换行变化带来的反复抖动
+let lastFitH = 0;
+/// 启动后是否已贴合过：首次直接落位不播动画，避免窗口刚显示就「缩一下」
+let bootFitted = false;
+
+/// 把窗口高度调到当前内容贴合的高度（切换 tab / 内容变化时调用），带过渡动画。
+/// 定住态与设置弹窗打开期间不贴合；floor 用于抬高下限（设置弹窗需要更多空间）。
+async function fitWindowHeight(force = false, floor = 0) {
+  if (document.body.classList.contains("pinned")) return;
+  if (settingsOpen()) return;
+  let h = measureContentHeight();
+  if (!h) return;
+  if (floor) h = Math.max(h, floor);
+  if (!force && Math.abs(h - lastFitH) < 6) return;
+  lastFitH = h;
+  const animate = bootFitted;
+  bootFitted = true;
+  try {
+    await invoke("fit_window_height", { height: h, animate });
+  } catch (_) {
+    /* 改不动尺寸不影响内容展示，保持当前高度即可 */
   }
 }
 
@@ -302,6 +344,8 @@ async function refresh(manual = false) {
     if (tipShown) showTip();
     // 取数完成即重置倒计时与自动刷新定时器（场景或间隔可能刚被改写）
     applyRefreshInterval();
+    // 内容高度可能随场景 / 错误横幅变化：贴合一次（切换 tab 的动画过渡就走这里）
+    fitWindowHeight();
   }
 }
 
@@ -322,6 +366,7 @@ function renderTabs() {
   // 只有一个已配置平台时 Tab 没有切换意义，收起把纵向空间还给内容
   if (configured.length < 2) {
     el.tabs.classList.add("hidden");
+    fitWindowHeight();
     return;
   }
   el.tabs.classList.remove("hidden");
@@ -334,6 +379,7 @@ function renderTabs() {
     tab.addEventListener("click", () => switchSource(s.id));
     el.tabs.appendChild(tab);
   }
+  fitWindowHeight();
 }
 
 /// 取当前场景配置的刷新间隔，并重建自动刷新定时器。
@@ -483,6 +529,8 @@ async function openSettings() {
     console.error(e);
   }
   showView("list");
+  // 弹窗需要更多纵向空间：先把窗口抬到至少 460，关闭时再贴合回内容
+  await fitWindowHeight(true, 460);
   el.settingsModal.classList.remove("hidden");
 }
 
@@ -490,6 +538,7 @@ function closeSettings() {
   el.settingsModal.classList.add("hidden");
   setSettingsMsg("", "");
   currentSource = null;
+  fitWindowHeight(true);
 }
 
 /// 首个凭证字段标题后面的指引链接：点它去对应的密钥管理页
@@ -748,7 +797,14 @@ async function setPinned(on) {
     } else {
       // 退出悬浮态时一并收起提示窗（Rust 侧也会收，这里先收掉避免闪一下）
       hideTip();
-      await invoke("set_pinned", { on });
+      // 趁还在定住态先量主视图贴合高度（摘 class → 量 → 还原，同一任务内完成不会重绘），
+      // 让 Rust 的取消定住动画直接落到这个高度，落地后不再二次调高
+      document.body.classList.remove("pinned");
+      const h = measureContentHeight();
+      document.body.classList.add("pinned");
+      lastFitH = h;
+      bootFitted = true;
+      await invoke("set_pinned", { on, height: h || null });
     }
   } catch (e) {
     if (on) document.body.classList.remove("pinned");
@@ -794,7 +850,7 @@ el.floatCard.addEventListener("click", (e) => {
 });
 
 // 悬浮卡片右键菜单：由 Rust 弹系统原生菜单（网页里自绘会被这么小的窗口裁掉），
-// 菜单项「关闭悬浮窗」走 menu-unpin 事件回到 setPinned，「退出软件」由 Rust 直接退出。
+// 菜单项「退出悬浮窗」走 menu-unpin 事件回到 setPinned，「退出软件」由 Rust 直接退出。
 // 这里 preventDefault 才不会再弹出 WebView 自带的 Reload 菜单。
 el.floatCard.addEventListener("contextmenu", (e) => {
   e.preventDefault();
@@ -802,6 +858,9 @@ el.floatCard.addEventListener("contextmenu", (e) => {
 });
 
 window.__TAURI__.event.listen("menu-unpin", () => setPinned(false));
+
+// 主窗口关闭按钮 = 定住：Rust 拦下关闭后发这个事件，这里走与「定住」按钮同一条路径
+window.__TAURI__.event.listen("close-to-pin", () => setPinned(true));
 
 /* ---------- 悬浮卡片悬停提示窗 ---------- */
 

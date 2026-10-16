@@ -1452,7 +1452,9 @@ mod float_guard {
 const NORMAL_W: f64 = 420.0;
 const NORMAL_H: f64 = 500.0;
 const NORMAL_MIN_W: f64 = 380.0;
-const NORMAL_MIN_H: f64 = 480.0;
+// 高度下限要低于最矮的 tab 内容（如 Trae 积分只有一张卡，贴合高度约 250），
+// 否则「按内容自适应高度」会被 min_size 钳制住缩不下去。
+const NORMAL_MIN_H: f64 = 240.0;
 // 悬浮窗（定住）尺寸
 // 宽度按内容自适应：前端量出卡片「贴合内容」时的宽度后调 set_float_width 收缩窗口，
 // 上限 COMPACT_W（容纳最长文案「近 5 小时剩余 + MM-DD HH:MM 重置」），
@@ -1472,6 +1474,10 @@ const ANIM_FRAME_MS: u64 = 8;
 /// 跨进程保留：下次启动直接回到退出时那个悬浮窗，而不是回到主界面。
 /// 仅内存态没法满足「退出软件后下次回到悬浮窗」的需求，所以落盘（不含任何密钥）。
 static PINNED: AtomicBool = AtomicBool::new(false);
+
+/// 是否正在退出：退出流程里若再收到窗口 CloseRequested 就放行，
+/// 避免「关窗转定住」的拦截把退出卡住
+static EXITING: AtomicBool = AtomicBool::new(false);
 
 /// 写入「定住」状态与悬浮窗坐标（`pos` 为 None 时保留原有的坐标）
 fn persist_pin_state(app: &tauri::AppHandle, pinned: bool, pos: Option<(i32, i32)>) {
@@ -1614,6 +1620,7 @@ async fn set_pinned(
     window: tauri::WebviewWindow,
     on: bool,
     width: Option<f64>,
+    height: Option<f64>,
 ) -> Result<(), String> {
     if on {
         apply_pinned_style(&window)?;
@@ -1651,7 +1658,7 @@ async fn set_pinned(
         // 红绿灯失效。因此放到独立线程：先恢复 decorations，等异步 mask 生效后再套用 Overlay。
         //
         // 注意：动画期间保持悬浮态的最小尺寸（COMPACT_MIN），否则从 236x100 放大到 420x500
-        // 的中间帧都小于 380x480，会被系统 min_size 钳制导致动画失效；等动画结束再放开。
+        // 的中间帧都小于 380x240，会被系统 min_size 钳制导致动画失效；等动画结束再放开。
         let w = window.clone();
         std::thread::spawn(move || {
             let _ = w.set_decorations(true);
@@ -1674,9 +1681,21 @@ async fn set_pinned(
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
 
-            // 目标矩形：普通尺寸 + 约束回工作区后的坐标（此时标题栏已恢复，chrome 差值准确）
+            // 目标矩形：普通宽度 + 前端量出的内容贴合高度（没给则回落 NORMAL_H），
+            // 取消定住的动画直接落到贴合高度，落地后不再二次调高
+            // （此时标题栏已恢复，chrome 差值准确）
             let (cw, ch) = chrome_delta(&w);
-            let inner = physical_size(&w, NORMAL_W, NORMAL_H);
+            let scale = w.scale_factor().unwrap_or(1.0);
+            let cap = w
+                .current_monitor()
+                .ok()
+                .flatten()
+                .map(|m| m.work_area().size.height as f64 / scale - ch as f64 / scale - 12.0)
+                .unwrap_or(NORMAL_H);
+            let h = height
+                .unwrap_or(NORMAL_H)
+                .clamp(NORMAL_MIN_H, cap.max(NORMAL_MIN_H));
+            let inner = physical_size(&w, NORMAL_W, h);
             let outer = (
                 (inner.0 as i32 + cw).max(0) as u32,
                 (inner.1 as i32 + ch).max(0) as u32,
@@ -1692,6 +1711,49 @@ async fn set_pinned(
             let _ = w.set_resizable(true);
         });
     }
+    Ok(())
+}
+
+/// 主窗口高度按当前 tab 内容自适应：前端量出内容「贴合高度」后回调。
+/// 窗口顶边不动、底边以 ~180ms 动画收放（复用 animate_rect）；定住态不走这里
+/// （悬浮卡有自己的尺寸逻辑）。高度夹在 [NORMAL_MIN_H, 当前显示器工作区] 之间，
+/// 内容比屏幕还高时停在封顶值、内容区自己滚动。
+#[tauri::command]
+async fn fit_window_height(
+    window: tauri::WebviewWindow,
+    height: f64,
+    animate: bool,
+) -> Result<(), String> {
+    if PINNED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let (_, ch) = chrome_delta(&window);
+    let cap = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.work_area().size.height as f64 / scale - ch as f64 / scale - 12.0)
+        .unwrap_or(NORMAL_H);
+    let target = height.clamp(NORMAL_MIN_H, cap.max(NORMAL_MIN_H));
+
+    let cur = window.inner_size().map_err(|e| e.to_string())?;
+    let cur_h = cur.height as f64 / scale;
+    if (cur_h - target).abs() < 1.0 {
+        return Ok(());
+    }
+    let (pw, ph) = physical_size(&window, cur.width as f64 / scale, target);
+    if !animate {
+        return window
+            .set_size(tauri::PhysicalSize::new(pw, ph))
+            .map_err(|e| e.to_string());
+    }
+    // 顶边保持不动：起点终点同坐标，animate_rect 只插值高度
+    let pos = window
+        .outer_position()
+        .map(|p| (p.x, p.y))
+        .map_err(|e| e.to_string())?;
+    animate_rect(&window, pos, (pw, ph));
     Ok(())
 }
 
@@ -1733,7 +1795,7 @@ const CARD_MENU_QUIT: &str = "card-quit";
 #[tauri::command]
 async fn show_card_menu(window: tauri::WebviewWindow) -> Result<(), String> {
     let menu = tauri::menu::MenuBuilder::new(&window)
-        .text(CARD_MENU_UNPIN, "关闭悬浮窗")
+        .text(CARD_MENU_UNPIN, "退出悬浮窗")
         .text(CARD_MENU_QUIT, "退出软件")
         .build()
         .map_err(|e| e.to_string())?;
@@ -1896,6 +1958,19 @@ fn main() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // 主窗口的关闭按钮不退出软件：拦下关闭并通知前端走「定住」同一条路径，
+            // 效果与界面里的「定住」按钮完全一致（收缩成悬浮卡、置顶、无边框）
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main"
+                    && !PINNED.load(Ordering::Relaxed)
+                    && !EXITING.load(Ordering::Relaxed)
+                {
+                    api.prevent_close();
+                    let _ = window.emit("close-to-pin", ());
+                }
+            }
+        })
         .on_menu_event(|app, event| match event.id().0.as_str() {
             CARD_MENU_UNPIN => {
                 let _ = app.emit("menu-unpin", ());
@@ -1915,6 +1990,7 @@ fn main() {
             open_url,
             set_pinned,
             set_float_width,
+            fit_window_height,
             set_tip_height,
             show_card_menu,
             startup_state,
@@ -1927,6 +2003,7 @@ fn main() {
         .run(|app, event| {
             // 退出前落盘：定住态下把「当前」坐标存下来，下次启动才能回到退出时那一刻的位置
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                EXITING.store(true, Ordering::Relaxed);
                 if PINNED.load(Ordering::Relaxed) {
                     let pos = app
                         .get_webview_window("main")
