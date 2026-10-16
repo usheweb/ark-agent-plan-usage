@@ -46,6 +46,13 @@
           sub: subs.join(" · "),
           reset: "",
           pct: null,
+          // 悬停提示窗：余额类场景按「余额 ÷ 日均消耗」估算可用天数
+          title: "Kimi 余额",
+          remainNum: total,
+          tip: [
+            ...(cash !== null ? [["现金余额", `${fmtNum(cash)} ${currency}`]] : []),
+            ...(voucher !== null ? [["代金券余额", `${fmtNum(voucher)} ${currency}`]] : []),
+          ],
         },
       };
     },

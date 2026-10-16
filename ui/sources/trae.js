@@ -44,6 +44,60 @@
     return `${mm}-${dd} ${hm}`;
   }
 
+  const DAY_MS = 24 * 3600 * 1000;
+
+  /// 时间戳（秒）-> MM-DD
+  function fmtMd(sec) {
+    const dt = new Date(Number(sec) * 1000);
+    if (isNaN(dt.getTime())) return "";
+    const mm = String(dt.getMonth() + 1).padStart(2, "0");
+    const dd = String(dt.getDate()).padStart(2, "0");
+    return `${mm}-${dd}`;
+  }
+
+  /// 主订阅包：当前未过期、额度最大的那个包（Ultra 连续包月这类）。
+  /// 日均消耗只按它算——签到 / 邀请 / 福利这类一次性奖励包往往很快就用光，
+  /// 把它们算进去会把日均抬得虚高。
+  function mainPack(raw) {
+    const packs = Array.isArray(raw?.user_entitlement_pack_list)
+      ? raw.user_entitlement_pack_list
+      : [];
+    const now = Date.now();
+    let best = null;
+    for (const pk of packs) {
+      const b = pk?.entitlement_base_info || {};
+      const limit = num(b?.quota?.credits_limit);
+      const start = num(b.start_time);
+      const end = num(b.end_time);
+      if (limit === null || limit <= 0 || end === null || end * 1000 <= now) continue;
+      if (!best || limit > best.limit) {
+        best = { limit, start: start || 0, end, used: num(pk?.usage?.credits_amount) || 0 };
+      }
+    }
+    return best;
+  }
+
+  /// 提示窗里的「预计可用天数」：
+  /// 日均消耗 = 主订阅包已用 ÷ 该包已过天数；预计天数 = 剩余积分 ÷ 日均消耗，
+  /// 且不超过距重置的天数——本周期内用不完就显示到重置为止，并在后面括注重置日期。
+  /// 周期刚开始（不足 1 天）日均消耗还没代表性，返回「—」。
+  function estimateDaysText(raw, remain) {
+    const pk = mainPack(raw);
+    const remainNum = typeof remain === "number" && isFinite(remain) ? remain : null;
+    if (!pk || remainNum === null || remainNum <= 0) return "—";
+    const now = Date.now();
+    if (!(pk.start > 0)) return "—";
+    const elapsedDays = (now - pk.start * 1000) / DAY_MS;
+    if (elapsedDays < 1) return "—";
+    const burn = pk.used / elapsedDays;
+    if (!(burn > 0)) return "—";
+    const leftInPeriod = (pk.end * 1000 - now) / DAY_MS;
+    if (!(leftInPeriod > 0)) return "—";
+    const days = Math.min(remainNum / burn, leftInPeriod);
+    const n = days >= 10 ? days.toFixed(0) : days.toFixed(1);
+    return `${n} 天（${fmtMd(pk.end)} 重置）`;
+  }
+
   window.AFP_SOURCES = window.AFP_SOURCES || {};
   window.AFP_SOURCES.trae = {
     render(data) {
@@ -82,6 +136,10 @@
             reset: "",
             pct: null,
             color: ringColor(0),
+            // 悬停提示窗：不限量套餐没有「消耗完」的概念，不给预计天数（remainNum 为 null）
+            title: "TRAE 积分余额",
+            remainNum: null,
+            tip: [["套餐", identity ? `${identity} · 不限量` : "不限量套餐"]],
           },
         };
       }
@@ -91,7 +149,14 @@
       const color = ringColor(pct);
       const offset = CIRC * (1 - clamped / 100);
       const remainTxt = fmtNum(agg.remaining);
-      const sub = identity || `已用 ${pct.toFixed(1)}%`;
+      const daysText = estimateDaysText(raw, agg.remaining);
+      // 卡片第三行：套餐身份后面直接跟「可用天数（重置日期）」，不用悬停就能看到还能撑多久
+      const sub =
+        daysText === "—"
+          ? identity || `已用 ${pct.toFixed(1)}%`
+          : identity
+            ? `${identity} · ${daysText}`
+            : daysText;
 
       return {
         badge,
@@ -124,6 +189,14 @@
           reset: "",
           pct,
           color,
+          // 悬停提示窗：剩余行由前端按 remain/unit 统一补，这里只给套餐与已用；
+          // 可用天数与重置日期已经落在卡片第三行（见上面的 sub），这里不再重复
+          title: "TRAE 积分余额",
+          remainNum: agg.remaining,
+          tip: [
+            ["套餐", identity || "—"],
+            ["已用", `${fmtNum(agg.used)} / ${fmtNum(agg.total)}`],
+          ],
         },
       };
     },

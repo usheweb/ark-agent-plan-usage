@@ -23,6 +23,14 @@
     return PLAN_NAMES[String(plan).toLowerCase()] || String(plan);
   }
 
+  /// 某个额度窗口的剩余量（取不到时返回 null，提示窗里就不列这一行）
+  function winRemain(win) {
+    if (!win) return null;
+    const quota = parseFloat(win.Quota ?? 0) || 0;
+    const used = parseFloat(win.Used ?? 0) || 0;
+    return Math.max(0, quota - used);
+  }
+
   function card(win, label) {
     if (!win) return "";
     const quota = parseFloat(win.Quota ?? 0) || 0;
@@ -89,6 +97,20 @@
           reset: `${fmtReset(fiveHour.ResetTime, true)} 重置`,
           pct,
           color,
+          // 悬停提示窗：卡片上只显示 5 小时窗口，提示里补齐周 / 月窗口。
+          // 预计可用天数暂不给：5 小时窗口算天数没有意义，待按「近 1 月」口径接入
+          title: "火山方舟额度",
+          remainLabel: "近 5 小时",
+          remainNum: winRemain(data?.AFPMonthly),
+          tip: [
+            ["套餐", badge],
+            ...(winRemain(data?.AFPWeekly) !== null
+              ? [["近 1 周", `${fmtNum(winRemain(data.AFPWeekly))} AFP`]]
+              : []),
+            ...(winRemain(data?.AFPMonthly) !== null
+              ? [["近 1 月", `${fmtNum(winRemain(data.AFPMonthly))} AFP`]]
+              : []),
+          ],
         },
       };
     },

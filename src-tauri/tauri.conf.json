@@ -1,7 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "唐三浪悬浮窗",
-  "version": "0.2.1",
+  "mainBinaryName": "tangsanlang-float",
+  "version": "0.2.2",
   "identifier": "com.tangsanlang.floating",
   "build": {
     "frontendDist": "../ui"
@@ -21,6 +22,21 @@
         "transparent": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
+        "visible": false
+      },
+      {
+        "label": "tip",
+        "url": "tooltip.html",
+        "title": "提示",
+        "width": 240,
+        "height": 186,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "shadow": false,
         "visible": false
       }
     ],

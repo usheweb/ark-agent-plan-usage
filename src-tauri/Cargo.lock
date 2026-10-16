@@ -40,25 +40,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-afp-usage"
-version = "0.2.1"
-dependencies = [
- "aes 0.8.4",
- "base64 0.22.1",
- "cbc 0.1.2",
- "chrono",
- "hex",
- "hmac 0.12.1",
- "keyring",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tauri",
- "tauri-build",
-]
-
-[[package]]
 name = "alloc-no-stdlib"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3960,6 +3941,25 @@ dependencies = [
  "pkg-config",
  "toml 0.8.2",
  "version-compare",
+]
+
+[[package]]
+name = "tangsanlang-float"
+version = "0.2.2"
+dependencies = [
+ "aes 0.8.4",
+ "base64 0.22.1",
+ "cbc 0.1.2",
+ "chrono",
+ "hex",
+ "hmac 0.12.1",
+ "keyring",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tauri",
+ "tauri-build",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "默认窗口权限；自定义 command 无需 ACL 声明",
-  "windows": ["main"],
+  "description": "默认窗口权限；自定义 command 无需 ACL 声明。tip 是悬停提示窗，需要 core:default 里的 event 监听权限才能收到 tip-data",
+  "windows": ["main", "tip"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

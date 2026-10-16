@@ -49,6 +49,13 @@
           sub: subs.join(" · "),
           reset: frozen ? `状态 ${d.status}` : "",
           pct: null,
+          // 悬停提示窗：余额类场景按「余额 ÷ 日均消耗」估算可用天数
+          title: "硅基流动余额",
+          remainNum: total,
+          tip: [
+            ...(charge !== null ? [["充值余额", `${fmtNum(charge)} ${currency}`]] : []),
+            ...(grant !== null ? [["赠送金额", `${fmtNum(grant)} ${currency}`]] : []),
+          ],
         },
       };
     },

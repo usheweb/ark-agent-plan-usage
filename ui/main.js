@@ -72,10 +72,19 @@ let credStorage = "keychain";
 let credPath = "";
 let currentSource = null;
 
-/// 会话解锁闸门状态（后端下发，不持久化）：未解锁前钥匙串源不取数、不弹授权框
-let credsUnlocked = false;
-/// 当前展示的场景是否为「锁定态」的钥匙串源（决定悬浮窗是否显示待授权入口）
+/// 当前展示的场景是否为「未解锁」的钥匙串源（决定悬浮窗是否显示待授权入口）
 let lockedScene = false;
+
+/// 某数据源本次运行是否可立即取数：auto 源看「本机登录态可用」，钥匙串源看「本次是否已连接」
+function sourceReady(id) {
+  const s = catalog.find((x) => x.id === id);
+  return !!s && s.ready === true;
+}
+
+/// 当前场景是否可立即取数（未连接时既不取数、也不启动自动刷新）
+function activeReady() {
+  return !!activeSource && sourceReady(activeSource);
+}
 
 /* ---------- 通用 ---------- */
 
@@ -96,6 +105,12 @@ function hideError() {
 /* ---------- 悬浮窗 ---------- */
 
 function updateFloat() {
+  renderFloat();
+  // 悬浮卡片随内容收缩宽度，短内容（如只有几位积分的 Trae）就不会在右侧空出一大块
+  fitFloatWidth();
+}
+
+function renderFloat() {
   const fg = el.floatRingFg;
   if (!fg) return;
 
@@ -147,6 +162,38 @@ function updateFloat() {
   el.floatRingPct.style.color = f.color || "#22d3ee";
 }
 
+/// 上次应用到窗口的悬浮卡宽度（逻辑像素），用来抑制数字位数变化带来的反复抖动
+let floatWidth = 0;
+
+/// 量出卡片「贴合内容」时的宽度：临时把卡片设为脱离文档流 + max-content，
+/// 读完立刻还原样式——同一个任务里量完就还原，浏览器来不及重绘，用户看不到这一下。
+function measureFloatWidth() {
+  const card = el.floatCard;
+  if (!card) return 0;
+  const prev = card.getAttribute("style");
+  card.style.position = "absolute";
+  card.style.width = "max-content";
+  const w = card.offsetWidth;
+  if (prev === null) card.removeAttribute("style");
+  else card.setAttribute("style", prev);
+  return w;
+}
+
+/// 定住态下让窗口宽度贴合内容；只有宽度变化超过 6px 才真正改窗口，
+/// 避免刷新时数字从 36,212.47 变成 9,999.99 就抖一下。
+async function fitFloatWidth(force = false) {
+  if (!document.body.classList.contains("pinned")) return;
+  const w = measureFloatWidth();
+  if (!w) return;
+  if (!force && Math.abs(w - floatWidth) < 6) return;
+  floatWidth = w;
+  try {
+    await invoke("set_float_width", { width: w });
+  } catch (_) {
+    /* 改不动尺寸不影响内容展示，保持原宽度即可 */
+  }
+}
+
 /* ---------- 内容区 ---------- */
 
 /// 数据源的展示交给它自己的渲染模块：ui/sources/<source>.js
@@ -179,27 +226,31 @@ function renderResult(res) {
 function renderLocked() {
   lockedScene = true;
   el.badge.textContent = "待授权";
+  const nm = catalog.find((s) => s.id === activeSource)?.name || "该平台";
   el.cards.innerHTML = `
     <div class="connect-card">
-      <div class="connect-title">连接账号</div>
-      <p class="connect-desc">点击后 macOS 会请求钥匙串授权，随后读取各平台已保存的密钥并加载数据。授权仅在本次运行内有效，下次启动仍需重新连接。</p>
+      <div class="connect-title">连接 ${nm}</div>
+      <p class="connect-desc">「${nm}」的凭证存在系统钥匙串里。点击后 macOS 会请求钥匙串授权，一次性读取所有已保存平台的密钥并加载数据；此后切换其他 tab 不再重复请求。授权仅在本次运行内有效。</p>
       <button type="button" class="primary-btn connect-btn" id="connect-btn">连接账号</button>
     </div>`;
-  el.cards.querySelector("#connect-btn").addEventListener("click", connectAccount);
+  el.cards
+    .querySelector("#connect-btn")
+    .addEventListener("click", () => connectSource(activeSource));
   lastFloat = null;
   updateFloat();
 }
 
-/// 解锁流程：请求钥匙串授权 → 读取各平台密钥 → 重新加载清单与数据 → 启动刷新
-async function connectAccount() {
+/// 按需连接某个数据源：请求钥匙串授权 → 读取该源密钥 → 重新加载清单与数据 → 启动刷新
+async function connectSource(id) {
+  const sid = id || activeSource;
+  if (!sid) return;
   const btn = document.getElementById("connect-btn");
   if (btn) {
     btn.disabled = true;
     btn.textContent = "连接中…";
   }
   try {
-    const r = await invoke("unlock_credentials");
-    credsUnlocked = r?.unlocked === true;
+    await invoke("unlock_source", { sourceId: sid });
     await reloadCatalog();
     await refresh(true);
   } catch (e) {
@@ -232,6 +283,7 @@ async function refresh(manual = false) {
       renderResult(res);
       hideError();
       const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      lastUpdatedAt = now;
       setStatus("live", `更新于 ${now}`);
     }
   } catch (e) {
@@ -246,6 +298,8 @@ async function refresh(manual = false) {
     el.refreshBtn.classList.remove("spinning");
     el.refreshText.textContent = "刷新";
     if (floatBusy) updateFloat();
+    // 提示窗开着时取数完成：顺手把里面的数字刷成新的
+    if (tipShown) showTip();
     // 取数完成即重置倒计时与自动刷新定时器（场景或间隔可能刚被改写）
     applyRefreshInterval();
   }
@@ -256,7 +310,7 @@ function updateCountdown() {
 }
 
 el.refreshBtn.addEventListener("click", () => refresh(true));
-el.connectSm.addEventListener("click", () => connectAccount());
+el.connectSm.addEventListener("click", () => connectSource(activeSource));
 
 /* ---------- 场景 Tab（M-05）+ 每场景刷新间隔（E-02） ---------- */
 
@@ -283,14 +337,14 @@ function renderTabs() {
 }
 
 /// 取当前场景配置的刷新间隔，并重建自动刷新定时器。
-/// 锁定态下不启动定时器，倒计时位置显示「待授权」（no-op，不刷出错误）。
+/// 当前场景未连接（钥匙串源未解锁）时不启动定时器，倒计时位置显示「待连接」（no-op，不刷出错误）。
 function applyRefreshInterval() {
   if (autoTimer) clearInterval(autoTimer);
   autoTimer = null;
 
-  if (!credsUnlocked) {
+  if (!activeReady()) {
     secondsLeft = refreshInterval;
-    el.countdown.textContent = "待授权";
+    el.countdown.textContent = "待连接";
     el.connectSm.classList.remove("hidden");
     return;
   }
@@ -314,6 +368,12 @@ async function switchSource(id) {
     await invoke("set_active_source", { sourceId: id });
   } catch (e) {
     showError(String(e));
+  }
+  // 切到需要凭证的 tab：此刻才读钥匙串（懒加载）。未连接才请求授权，已连接直接取数。
+  const def = catalog.find((s) => s.id === id);
+  if (def && !def.autoCreds && !def.ready) {
+    await connectSource(id);
+    return;
   }
   await refresh(true);
 }
@@ -381,13 +441,13 @@ function renderSourceList() {
       stateText = s.id === activeSource ? "当前 · 已配置" : "已配置";
       ok = true;
     } else if (s.hasCreds) {
-      // 已保存但未解锁：不能显示成「未配置」，否则会诱导用户重录
-      stateText = "已保存 · 待解锁";
+      // 已保存但未连接：不能显示成「未配置」，否则会诱导用户重录
+      stateText = "已保存 · 待连接";
     } else {
       stateText = "未配置";
     }
     state.className =
-      "source-row-state" + (ok ? " ok" : s.hasCreds && !credsUnlocked ? " warn" : "");
+      "source-row-state" + (ok ? " ok" : s.hasCreds && !s.unlocked ? " warn" : "");
     state.textContent = stateText;
 
     row.append(main, state);
@@ -400,7 +460,6 @@ async function reloadCatalog() {
   const res = await invoke("list_sources");
   catalog = res?.sources || [];
   activeSource = res?.active || null;
-  credsUnlocked = res?.unlocked === true;
   credStorage = res?.storage === "file" ? "file" : "keychain";
   credPath = res?.path || "";
   renderStorageDesc();
@@ -455,8 +514,8 @@ function openDetail(id) {
   setSettingsMsg("", "");
 
   const isAuto = def.autoCreds === true;
-  // 已保存凭证但当前锁定：不能在这一态读取钥匙串，也不能诱导用户重录覆盖旧密钥
-  const lockedHasCreds = !isAuto && !credsUnlocked && def.hasCreds === true;
+  // 已保存凭证但本次运行尚未连接：不能在这一态读取钥匙串，也不能诱导用户重录覆盖旧密钥
+  const lockedHasCreds = !isAuto && !def.unlocked && def.hasCreds === true;
   el.detailFields.innerHTML = "";
 
   if (isAuto) {
@@ -483,7 +542,7 @@ function openDetail(id) {
     }
   } else {
     if (lockedHasCreds) {
-      el.detailDesc.textContent = `${def.subtitle} · 该平台已保存凭证，但当前处于锁定态。请先返回主界面点击「连接账号」解锁后再查看或修改。`;
+      el.detailDesc.textContent = `${def.subtitle} · 该平台已保存凭证，但本次运行尚未连接。请先切到「${def.name}」的 tab 点击「连接账号」读取后再查看或修改。`;
     } else {
       el.detailDesc.textContent = `${def.subtitle} · 凭证只存本机，用于调用 ${def.name} 的接口。`;
     }
@@ -677,9 +736,22 @@ async function setPinned(on) {
     pinBusy = false;
   }, 500);
   try {
-    if (on) closeSettings();
-    await invoke("set_pinned", { on });
+    if (on) {
+      closeSettings();
+      // 先切到悬浮布局：一是量出内容宽度，好让窗口一次缩到位（动画结束就不再跳一下）；
+      // 二是让收缩过程里展示的就是悬浮卡片（Rust 随后还会补发一次 pin-state）
+      document.body.classList.add("pinned");
+      updateFloat();
+      const w = measureFloatWidth();
+      floatWidth = w;
+      await invoke("set_pinned", { on, width: w || null });
+    } else {
+      // 退出悬浮态时一并收起提示窗（Rust 侧也会收，这里先收掉避免闪一下）
+      hideTip();
+      await invoke("set_pinned", { on });
+    }
   } catch (e) {
+    if (on) document.body.classList.remove("pinned");
     showError(String(e));
   }
 }
@@ -689,6 +761,7 @@ window.__TAURI__.event.listen("pin-state", (e) => {
   const on = !!e.payload;
   document.body.classList.toggle("pinned", on);
   if (on) updateFloat();
+  else hideTip();
 });
 
 el.pinBtn.addEventListener("click", () => setPinned(true));
@@ -702,6 +775,10 @@ let floatDown = null;
 el.floatCard.addEventListener("pointerdown", (e) => {
   if (e.button !== 0) return;
   floatDown = { x: e.screenX, y: e.screenY };
+  // 一按下去（可能拖拽）就收起提示窗，别让提示跟着窗口一起拖
+  tipHold = true;
+  clearTimeout(tipTimer);
+  hideTip();
 });
 el.floatCard.addEventListener("pointercancel", () => {
   floatDown = null;
@@ -712,7 +789,7 @@ el.floatCard.addEventListener("click", (e) => {
     floatDown && Math.hypot(e.screenX - floatDown.x, e.screenY - floatDown.y) > 6;
   floatDown = null;
   if (moved) return;
-  if (lockedScene) connectAccount();
+  if (lockedScene) connectSource(activeSource);
   else refresh(true);
 });
 
@@ -726,10 +803,77 @@ el.floatCard.addEventListener("contextmenu", (e) => {
 
 window.__TAURI__.event.listen("menu-unpin", () => setPinned(false));
 
+/* ---------- 悬浮卡片悬停提示窗 ---------- */
+
+/// 提示窗内容比卡片窗口还高，所以它落在另一个小窗口里（见 Rust 的 show_float_tip），
+/// 这里只负责算内容和决定什么时候让它出现 / 收起。
+/// 各行内容由数据源自己给（`float.tip`）——「预计可用天数」的口径各平台不同，
+/// 比如 Trae 的月配额型按「订阅包已用 ÷ 已过天数」当场算，不走本地采样。
+let lastUpdatedAt = "";
+let tipShown = false;
+/// 指针按下过（拖拽 / 点击）之后先别弹，等指针重新进来或松手后再弹
+let tipHold = false;
+let tipTimer = null;
+
+/// 组装提示窗内容：标题 → 剩余 → 各平台自己的行 → 页脚
+function buildTipPayload() {
+  const f = lastFloat;
+  if (!f) return null;
+
+  const rows = [[f.remainLabel || "剩余", `${f.remain ?? "—"}${f.unit ? ` ${f.unit}` : ""}`]];
+  for (const [k, v, tone] of f.tip || []) rows.push(tone ? [k, v, tone] : [k, v]);
+
+  return {
+    title: f.title || el.subtitle.textContent || "用量",
+    rows,
+    foot: [`更新于 ${lastUpdatedAt || "—"}`, "点击面板可刷新"],
+  };
+}
+
+async function showTip() {
+  if (!document.body.classList.contains("pinned")) return;
+  const payload = buildTipPayload();
+  if (!payload) return;
+  tipShown = true;
+  try {
+    await invoke("show_float_tip", { payload });
+  } catch (_) {
+    tipShown = false;
+  }
+}
+
+async function hideTip() {
+  if (!tipShown) return;
+  tipShown = false;
+  try {
+    await invoke("hide_float_tip");
+  } catch (_) {
+    /* 收起失败也不影响使用，下次进入还会重设 */
+  }
+}
+
+// 停在卡片上：略等一下再弹（只是划过就不弹了）；离开就收。
+// 松手后再等一拍重弹，这样「点一下刷新」之后提示还会回来。
+el.floatCard.addEventListener("mouseenter", () => {
+  if (tipHold) return;
+  clearTimeout(tipTimer);
+  tipTimer = setTimeout(showTip, 150);
+});
+el.floatCard.addEventListener("mouseleave", () => {
+  clearTimeout(tipTimer);
+  tipHold = false;
+  hideTip();
+});
+el.floatCard.addEventListener("pointerup", () => {
+  tipHold = false;
+  clearTimeout(tipTimer);
+  tipTimer = setTimeout(showTip, 400);
+});
+
 // 倒计时每秒走一格；自动刷新定时器由 applyRefreshInterval 按当前场景的间隔维护
 setInterval(() => {
-  // 锁定态：倒计时冻结（显示「待授权」），不做任何刷新
-  if (!credsUnlocked) return;
+  // 当前场景未连接：倒计时冻结（显示「待连接」），不做任何刷新
+  if (!activeReady()) return;
   secondsLeft -= 1;
   if (secondsLeft <= 0) {
     secondsLeft = refreshInterval;
@@ -738,17 +882,17 @@ setInterval(() => {
 }, 1000);
 
 async function bootstrap() {
-  await refresh(false);
+  // 先拉清单（不触碰钥匙串）：让 tab / 列表 / 待连接卡片都能拿到平台名，再取数
   try {
     await reloadCatalog();
     const cur = catalog.find((s) => s.id === activeSource);
-    // 锁定态下钥匙串源「已保存与否」暂不可判定，不弹设置（主界面已给「连接账号」入口）；
-    // 其余情况（trae 不可用 / 解锁后确实未配置）仍按原逻辑引导去设置页录入。
-    const keychainLocked = !credsUnlocked && !cur?.autoCreds;
-    if (!cur?.configured && !keychainLocked) openSettings();
+    // 已保存凭证但本次尚未连接的钥匙串源不弹设置（主界面已给「连接账号」入口）；
+    // trae 不可用 / 确实未配置仍按原逻辑引导去设置页录入。
+    if (!cur?.configured) openSettings();
   } catch (_) {
     /* 忽略：清单读取失败不影响主流程 */
   }
+  await refresh(false);
 }
 
 // 启动流程：窗口以 visible:false 创建（否则会先闪一下主界面大窗、悬浮态很穿帮）。

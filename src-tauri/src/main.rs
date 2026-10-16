@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use hmac::{Hmac, Mac};
@@ -200,10 +200,39 @@ const TRAE_CHECKSUM_LEN: usize = 64;
 /// 密钥派生用的固定 64 字节混淆表（= byteCrypto.js 里 Sle ^ ble），hex 表示
 const TRAE_PAD_HEX: &str = "4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58";
 
-/// macOS 上 Trae CN 的登录态文件路径
+/// Trae CN 登录态文件的候选路径（按平台取）。Electron 应用的用户目录在不同系统下位置不同：
+/// - macOS：`$HOME/Library/Application Support/Trae CN/User/globalStorage/storage.json`
+/// - Windows：`%APPDATA%\Trae CN\User\globalStorage\storage.json`（Windows 的「AppData\Roaming」）
+fn trae_storage_candidates() -> Vec<PathBuf> {
+    const REL: &str = "Trae CN/User/globalStorage/storage.json";
+    let mut list: Vec<PathBuf> = Vec::new();
+    if cfg!(target_os = "windows") {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                list.push(PathBuf::from(appdata).join(REL));
+            }
+        }
+        // APPDATA 拿不到时，回退到 %USERPROFILE%\AppData\Roaming
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.trim().is_empty() {
+                list.push(PathBuf::from(profile).join("AppData/Roaming").join(REL));
+            }
+        }
+    } else {
+        let home = std::env::var("HOME").unwrap_or_default();
+        list.push(PathBuf::from(home).join("Library/Application Support").join(REL));
+    }
+    list
+}
+
+/// Trae CN 登录态文件路径：优先取第一个「真实存在」的候选，都不存在时回退到主候选
 fn trae_storage_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/Trae CN/User/globalStorage/storage.json")
+    let candidates = trae_storage_candidates();
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .unwrap_or_else(|| candidates.into_iter().next().unwrap_or_default())
 }
 
 /// 读取并解析 Trae CN 登录态文件
@@ -505,24 +534,42 @@ const KEYRING_SERVICE: &str = "com.tangsanlang.floating";
 /// 改 identifier 之前用过的钥匙串服务名，解锁时把条目一次性搬到新服务名下
 const LEGACY_KEYRING_SERVICE: &str = "com.usheai.afpusage";
 
-/* ---------- 会话级解锁闸门（E-01 改造） ---------- */
+/* ---------- 会话级解锁闸门（按数据源懒加载） ---------- */
 
-/// 会话级解锁状态：默认 false，仅当用户点击「连接账号」后才置位，**不写盘**。
+/// 本次运行内已解锁（可读钥匙串）的数据源 id 列表。默认空，**不写盘**。
 ///
-/// 未解锁前，所有读钥匙串的函数都直接返回空、不调用 keyring，因此启动过程
-/// 不会触碰钥匙串、不弹授权框；解锁与否只对本次运行有效，下次启动仍要求重新连接。
-static CREDS_UNLOCKED: Mutex<bool> = Mutex::new(false);
+/// 启动阶段列表为空，因此所有读钥匙串的函数都直接返回空、绝不调用 keyring，不会弹授权框；
+/// 用户**第一次**切到需要凭证的 tab（或点「连接账号」）时，`unlock_all_sources` 会把**全部**
+/// 有凭证的数据源一次性读进内存并加入这里，此后切换任何 tab 都命中已解锁状态、不再重复弹框。
+/// 解锁与否只对本次运行有效，下次启动仍是「首次触发才读」。
+static UNLOCKED_SOURCES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// 当前会话是否已解锁钥匙串读取
-fn creds_unlocked() -> bool {
-    CREDS_UNLOCKED.lock().map(|v| *v).unwrap_or(false)
+/// 该数据源本次运行是否已解锁（可读钥匙串）
+fn source_unlocked(id: &str) -> bool {
+    UNLOCKED_SOURCES
+        .lock()
+        .map(|v| v.iter().any(|x| x == id))
+        .unwrap_or(false)
 }
 
-/// 置位会话解锁状态（仅本次运行有效）
-fn set_creds_unlocked(on: bool) {
-    if let Ok(mut slot) = CREDS_UNLOCKED.lock() {
-        *slot = on;
+/// 置位 / 清除某数据源的会话解锁状态（仅本次运行有效）
+fn set_source_unlocked(id: &str, on: bool) {
+    if let Ok(mut v) = UNLOCKED_SOURCES.lock() {
+        let present = v.iter().any(|x| x == id);
+        if on && !present {
+            v.push(id.to_string());
+        } else if !on && present {
+            v.retain(|x| x != id);
+        }
     }
+}
+
+/// 本次运行是否有任意数据源已解锁（用于判断钥匙串存储方式是否需真实探测）
+fn any_source_unlocked() -> bool {
+    UNLOCKED_SOURCES
+        .lock()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 /// 钥匙串是否可用：进程内只探测一次，结果缓存下来
@@ -544,9 +591,9 @@ fn keychain_entry(id: &str) -> Result<keyring::Entry, String> {
 }
 
 /// 读钥匙串里某个平台的凭证；没有条目或钥匙串不可用时返回 None。
-/// 锁定态下直接返回 None，绝不调用 keyring（避免启动 / 锁定时弹出授权框）。
+/// 该源未解锁时直接返回 None，绝不调用 keyring（避免启动 / 未连接时弹出授权框）。
 fn read_keychain_creds(id: &str) -> Option<HashMap<String, String>> {
-    if !creds_unlocked() {
+    if !source_unlocked(id) {
         return None;
     }
     let entry = keychain_entry(id).ok()?;
@@ -676,9 +723,9 @@ fn mark_migration_done(app: &tauri::AppHandle, key: &str) {
 }
 
 /// 读某平台凭证：钥匙串优先，取不到再退回凭证文件。
-/// 锁定态下直接返回空，钥匙串与明文都不读（「先连接再加载」）。
+/// 该源未解锁时直接返回空，钥匙串与明文都不读（「先连接再加载」）。
 fn read_source_creds(app: &tauri::AppHandle, id: &str) -> HashMap<String, String> {
-    if !creds_unlocked() {
+    if !source_unlocked(id) {
         return HashMap::new();
     }
     if keychain_ready() {
@@ -727,68 +774,48 @@ fn delete_source_creds(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     }
 }
 
-/// 一次性迁移：把凭证文件里的历史明文搬进系统钥匙串，成功后抹掉文件里的那份。
-/// **只在解锁流程里调用**（启动不执行），迁移完成或钥匙串不可用时跳过，不触碰钥匙串。
+/// 一次性迁移：把凭证文件里某平台的历史明文搬进系统钥匙串，成功后抹掉文件里的那份。
+/// **只在解锁该源时调用**（启动不执行），且只处理这一个平台，不触碰其他平台的钥匙串。
 ///
 /// 钥匙串里已有该平台条目时跳过（避免用旧明文覆盖），那份明文会留到用户下次
 /// 保存凭证时才清掉 —— 宁可多留一份，也不冒丢掉密钥的风险。
-fn migrate_plaintext_to_keychain(app: &tauri::AppHandle) {
-    if migration_done(app, "plaintext") || !keychain_ready() {
+fn migrate_source_to_keychain(app: &tauri::AppHandle, id: &str) {
+    let key = format!("plaintext:{}", id);
+    if migration_done(app, &key) || !keychain_ready() {
         return;
     }
-
-    let ids: Vec<String> = read_store(app)
-        .get("sources")
-        .and_then(|s| s.as_object())
-        .map(|obj| obj.keys().cloned().collect())
-        .unwrap_or_default();
-
-    for id in &ids {
-        let creds = clean_creds(read_plaintext_creds(app, id));
-        if creds.is_empty() || read_keychain_creds(id).is_some() {
-            continue;
+    let creds = clean_creds(read_plaintext_creds(app, id));
+    if !creds.is_empty() && read_keychain_creds(id).is_none() {
+        if let Ok(entry) = keychain_entry(id) {
+            if let Ok(blob) = serde_json::to_string(&creds) {
+                if entry.set_password(&blob).is_ok() {
+                    let _ = remove_plaintext_creds(app, id);
+                }
+            }
         }
-        let Ok(entry) = keychain_entry(id) else {
-            continue;
-        };
-        let Ok(blob) = serde_json::to_string(&creds) else {
-            continue;
-        };
-        if entry.set_password(&blob).is_err() {
-            continue;
-        }
-        let _ = remove_plaintext_creds(app, id);
     }
-
-    mark_migration_done(app, "plaintext");
+    mark_migration_done(app, &key);
 }
 
-/// 一次性迁移：把旧服务名（改 identifier 前）下的钥匙串条目搬到新服务名下。
-/// **只在解锁流程里调用**（启动不执行），迁移完成或钥匙串不可用时跳过。
+/// 一次性迁移：把旧服务名（改 identifier 前）下某平台的钥匙串条目搬到新服务名下。
+/// **只在解锁该源时调用**（启动不执行），且只处理这一个平台，不触碰其他平台的钥匙串。
 ///
 /// 新服务名下已有同平台条目时跳过（不覆盖），旧条目读完确认新条目写成功后才删。
-fn migrate_legacy_keyring_service(app: &tauri::AppHandle) {
-    if migration_done(app, "legacyService") || !keychain_ready() {
+fn migrate_legacy_service_for(app: &tauri::AppHandle, id: &str) {
+    let key = format!("legacyService:{}", id);
+    if migration_done(app, &key) || !keychain_ready() {
         return;
     }
-    for def in SOURCES {
-        let Ok(old) = keyring::Entry::new(LEGACY_KEYRING_SERVICE, def.id) else {
-            continue;
-        };
-        let Ok(secret) = old.get_password() else {
-            continue;
-        };
-        let Ok(new) = keychain_entry(def.id) else {
-            continue;
-        };
-        if new.get_password().is_ok() {
-            continue;
-        }
-        if new.set_password(&secret).is_ok() {
-            let _ = old.delete_credential();
+    if let Ok(old) = keyring::Entry::new(LEGACY_KEYRING_SERVICE, id) {
+        if let Ok(secret) = old.get_password() {
+            if let Ok(new) = keychain_entry(id) {
+                if new.get_password().is_err() && new.set_password(&secret).is_ok() {
+                    let _ = old.delete_credential();
+                }
+            }
         }
     }
-    mark_migration_done(app, "legacyService");
+    mark_migration_done(app, &key);
 }
 
 /// 该数据源的必需字段是否都填了
@@ -797,12 +824,12 @@ fn creds_complete(def: &SourceDef, creds: &HashMap<String, String>) -> bool {
 }
 
 /// 取当前生效的凭证：应用内设置优先，火山方舟再兜底 .env / 环境变量。
-/// 锁定态下直接返回 None —— 既不读钥匙串，也跳过 .env 兜底（否则方舟会在锁定时照常出数）。
+/// 该源未解锁时直接返回 None —— 既不读钥匙串，也跳过 .env 兜底（否则方舟会在未连接时照常出数）。
 fn effective_creds(
     app: &tauri::AppHandle,
     def: &SourceDef,
 ) -> Option<(HashMap<String, String>, &'static str)> {
-    if !creds_unlocked() {
+    if !source_unlocked(def.id) {
         return None;
     }
     let saved = read_source_creds(app, def.id);
@@ -1002,10 +1029,10 @@ async fn fetch_afp_usage(ak: &str, sk: &str) -> Result<serde_json::Value, String
 }
 
 /// 平台清单：供设置弹窗渲染「平台列表 + 各平台字段」，并回填已保存的值。
-/// **不触碰钥匙串**：已保存与否只看明文标记，凭证值仅在解锁后才回填。
+/// **不触碰钥匙串**：已保存与否只看明文标记，凭证值仅在该源解锁后才回填。
 #[tauri::command]
 fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
-    let unlocked = creds_unlocked();
+    let any_unlocked = any_source_unlocked();
     let path = credentials_path(&app)
         .map(|p| p.display().to_string())
         .unwrap_or_default();
@@ -1028,10 +1055,12 @@ fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
             } else {
                 has_saved_creds(&app, def.id)
             };
-            // 已保存的值：解锁后读钥匙串回填；锁定态只从明文文件读（通常为空）
+            // 该源本次运行是否已解锁（可读钥匙串）
+            let src_unlocked = !def.auto_creds && source_unlocked(def.id);
+            // 已保存的值：该源解锁后读钥匙串回填；未解锁只从明文文件读（通常为空）
             let saved = if def.auto_creds {
                 HashMap::new()
-            } else if unlocked {
+            } else if src_unlocked {
                 read_source_creds(&app, def.id)
             } else {
                 read_plaintext_creds(&app, def.id)
@@ -1056,8 +1085,12 @@ fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
                     (ok, ok, "auto")
                 }
                 None => {
-                    let ready = has_creds && unlocked;
-                    (ready, ready, if ready { "settings" } else { "none" })
+                    // configured 只看「是否保存过凭证」（与是否解锁无关，未解锁也要据此显示 tab / 列表项）
+                    (
+                        has_creds,
+                        has_creds && src_unlocked,
+                        if has_creds { "settings" } else { "none" },
+                    )
                 }
             };
             let fields: Vec<serde_json::Value> = def
@@ -1081,6 +1114,7 @@ fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
                 "helpText": def.help_text,
                 "configured": configured,
                 "ready": ready,
+                "unlocked": src_unlocked,
                 "hasCreds": has_creds,
                 "credentialSource": cred_source,
                 "interval": interval_of(def.id),
@@ -1097,9 +1131,9 @@ fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
     serde_json::json!({
         "path": path,
         "active": active_source_id(&app),
-        "unlocked": unlocked,
-        // 锁定态不探测钥匙串可用性（避免触碰 keyring），先按钥匙串假设；解锁后回填真实值
-        "storage": if unlocked {
+        "unlocked": any_unlocked,
+        // 未解锁任何源时不探测钥匙串可用性（避免触碰 keyring），先按钥匙串假设；解锁后回填真实值
+        "storage": if any_unlocked {
             if keychain_ready() { "keychain" } else { "file" }
         } else {
             "keychain"
@@ -1151,6 +1185,9 @@ fn save_source_credentials(
 
     write_source_creds(&app, def.id, &clean)?;
 
+    // 刚写入的源本次运行即可读（无需再走一次「连接账号」）
+    set_source_unlocked(def.id, true);
+
     // 凭证本身已进钥匙串 / 凭证文件，配置文件里只留「当前场景」这个非敏感标记
     let mut store = read_store(&app);
     store["active"] = serde_json::json!(def.id);
@@ -1165,39 +1202,43 @@ fn save_source_credentials(
 fn clear_source_credentials(app: tauri::AppHandle, source_id: String) -> Result<(), String> {
     source_def(&source_id).ok_or_else(|| format!("未支持的数据源: {}", source_id))?;
     delete_source_creds(&app, &source_id)?;
+    // 该源已无凭证，收回本次运行的解锁态（再切到它的 tab 会重新按需读取）
+    set_source_unlocked(&source_id, false);
     // 成功删除后从明文标记里移除该平台
     mark_saved(&app, &source_id, false)
 }
 
-/// 连接账号：解锁本次会话的钥匙串读取，并完成一次性迁移与标记回填。
+/// 连接账号：把本次会话需要的钥匙串**一次性全部**读进内存。
 ///
-/// 这是启动「零钥匙串访问」的唯一入口：用户点击后才置位会话解锁、执行两个一次性
-/// 迁移（明文→钥匙串、遗留服务名迁移），并探测各平台钥匙串里是否已有凭证，
-/// 把「有凭证的平台 id 列表」写进明文标记（不含任何密钥值）。
-/// 返回给前端 `{"unlocked": true, "platforms": ["volcengine", ...]}`。
+/// 启动阶段不读钥匙串、不弹授权框；用户**第一次**切到某个需要凭证的 tab（或点「连接账号」）时
+/// 才调用这里 —— 它随即把**所有**平台的密钥一起读出来并缓存解锁态。此后切换任何 tab 都直接用
+/// 已缓存的凭证，不再重复弹授权框（「首次触发一次、之后全局免再输」）。
+/// `source_id` 仅用于校验（前端始终传当前 tab），实际执行的是全量解锁。
+/// 返回读到的平台：`{"unlocked": true, "platforms": ["volcengine", ...]}`。
 #[tauri::command]
-fn unlock_credentials(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    // 先置位会话解锁，迁移与探测才能读钥匙串（此时才可能弹授权框）
-    set_creds_unlocked(true);
+fn unlock_source(app: tauri::AppHandle, source_id: String) -> Result<serde_json::Value, String> {
+    source_def(&source_id).ok_or_else(|| format!("未支持的数据源: {}", source_id))?;
+    unlock_all_sources(&app)
+}
 
-    migrate_legacy_keyring_service(&app);
-    migrate_plaintext_to_keychain(&app);
-
-    // 探测各平台钥匙串里是否已有凭证
+/// 全量解锁：把所有非 auto 数据源的凭证读进内存并置位解锁态。
+/// 每个源只为它自己跑一次性迁移；读不到凭证的源会收回解锁态（前端仍按「未连接」展示）。
+fn unlock_all_sources(app: &tauri::AppHandle) -> Result<serde_json::Value, String> {
     let mut platforms: Vec<String> = Vec::new();
     for def in SOURCES.iter().filter(|d| !d.auto_creds) {
-        if read_keychain_creds(def.id).is_some() {
-            platforms.push(def.id.to_string());
-        }
-    }
-    // 钥匙串不可用时的明文兜底也一并纳入标记
-    for def in SOURCES.iter().filter(|d| !d.auto_creds) {
-        if !platforms.iter().any(|p| p == def.id) && !read_plaintext_creds(&app, def.id).is_empty() {
-            platforms.push(def.id.to_string());
-        }
-    }
-    write_saved_ids(&app, &platforms)?;
+        // 先置位解锁，迁移与读取才能访问钥匙串（此时才可能弹授权框）
+        set_source_unlocked(def.id, true);
+        migrate_legacy_service_for(app, def.id);
+        migrate_source_to_keychain(app, def.id);
 
+        // 读该源在钥匙串里的凭证；有则同步「已保存」明文标记（供未解锁时判断）
+        if read_source_creds(app, def.id).is_empty() {
+            set_source_unlocked(def.id, false);
+        } else {
+            mark_saved(app, def.id, true)?;
+            platforms.push(def.id.to_string());
+        }
+    }
     Ok(serde_json::json!({ "unlocked": true, "platforms": platforms }))
 }
 
@@ -1223,8 +1264,8 @@ async fn get_source_data(
         .unwrap_or_else(|| active_source_id(&app));
     let def = source_def(&id).ok_or_else(|| format!("未支持的数据源: {}", id))?;
 
-    // 锁定态：钥匙串类数据源不取数，返回可被前端识别的「待授权」结构（而非红色报错）
-    if !def.auto_creds && !creds_unlocked() {
+    // 该源未解锁：钥匙串类数据源不取数，返回可被前端识别的「待授权」结构（而非红色报错）
+    if !def.auto_creds && !source_unlocked(&id) {
         return Ok(serde_json::json!({
             "source": def.id,
             "name": def.name,
@@ -1413,12 +1454,15 @@ const NORMAL_H: f64 = 500.0;
 const NORMAL_MIN_W: f64 = 380.0;
 const NORMAL_MIN_H: f64 = 480.0;
 // 悬浮窗（定住）尺寸
-// 宽度需容纳「近 5 小时剩余 + MM-DD HH:MM 重置」整行文案（约 249px 最小内容宽），
-// 否则卡片会被内容撑宽、右侧圆弧被窗口裁掉变成直角
+// 宽度按内容自适应：前端量出卡片「贴合内容」时的宽度后调 set_float_width 收缩窗口，
+// 上限 COMPACT_W（容纳最长文案「近 5 小时剩余 + MM-DD HH:MM 重置」），
+// 短内容平台（如 Trae 的积分）就不用再在右侧空出一大片。
+// 高度以内容里最高的元素（52px 的圆环）为基准：卡片竖向留白 = COMPACT_H - 52，
+// 定 70 后上下各约 9px（原 88 是 36px，用户反馈太空，砍掉一半）。
 const COMPACT_W: f64 = 264.0;
-const COMPACT_H: f64 = 100.0;
-const COMPACT_MIN_W: f64 = 200.0;
-const COMPACT_MIN_H: f64 = 90.0;
+const COMPACT_H: f64 = 70.0;
+const COMPACT_MIN_W: f64 = 180.0;
+const COMPACT_MIN_H: f64 = 60.0;
 
 // 悬浮窗放大 / 缩小过渡动画：总时长与每帧间隔
 const ANIM_MS: u64 = 180;
@@ -1554,9 +1598,11 @@ fn apply_pinned_style(window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
-/// 计算「定住」后的目标矩形：尺寸固定为悬浮尺寸，位置优先还原上次摆放处，否则沿用当前坐标。
-fn pinned_target(window: &tauri::WebviewWindow) -> ((i32, i32), (u32, u32)) {
-    let target_size = physical_size(window, COMPACT_W, COMPACT_H);
+/// 计算「定住」后的目标矩形：高度固定为悬浮高度，宽度取前端量到的贴合宽度
+/// （`None` 则用上限 COMPACT_W），位置优先还原上次摆放处，否则沿用当前坐标。
+fn pinned_target(window: &tauri::WebviewWindow, width: Option<f64>) -> ((i32, i32), (u32, u32)) {
+    let w = width.unwrap_or(COMPACT_W).clamp(COMPACT_MIN_W, COMPACT_W);
+    let target_size = physical_size(window, w, COMPACT_H);
     let cur = window.outer_position().map(|p| (p.x, p.y)).unwrap_or((0, 0));
     let pos = clamped_pos(window, saved_float_pos(window.app_handle()).unwrap_or(cur), target_size);
     (pos, target_size)
@@ -1564,12 +1610,16 @@ fn pinned_target(window: &tauri::WebviewWindow) -> ((i32, i32), (u32, u32)) {
 
 /// 切换「定住」悬浮窗模式：缩小窗口、无边框、置顶。
 #[tauri::command]
-async fn set_pinned(window: tauri::WebviewWindow, on: bool) -> Result<(), String> {
+async fn set_pinned(
+    window: tauri::WebviewWindow,
+    on: bool,
+    width: Option<f64>,
+) -> Result<(), String> {
     if on {
         apply_pinned_style(&window)?;
 
-        // 提前算好最终落点
-        let (target_pos, target_size) = pinned_target(&window);
+        // 提前算好最终落点（宽度用前端量出的贴合宽度，动画一次到位、动画后不再跳一下）
+        let (target_pos, target_size) = pinned_target(&window, width);
 
         // 先让前端切到悬浮布局，再动画，保证收缩过程里展示的就是悬浮卡片
         let _ = window.emit("pin-state", true);
@@ -1586,6 +1636,10 @@ async fn set_pinned(window: tauri::WebviewWindow, on: bool) -> Result<(), String
         // 在窗口仍为悬浮尺寸时记录当前位置，供下次定住时还原
         save_float_pos(&window);
         PINNED.store(false, Ordering::Relaxed);
+        // 退出悬浮态时收起提示窗，避免它孤零零挂在主界面上方
+        if let Some(tip) = window.app_handle().get_webview_window("tip") {
+            let _ = tip.hide();
+        }
         #[cfg(target_os = "windows")]
         float_guard::set_active(false);
         window.set_always_on_top(false).map_err(|e| e.to_string())?;
@@ -1641,6 +1695,20 @@ async fn set_pinned(window: tauri::WebviewWindow, on: bool) -> Result<(), String
     Ok(())
 }
 
+/// 悬浮卡按内容自适应宽度：前端量出卡片「贴合内容」时的宽度后回调。
+/// 只在定住态生效（普通窗口的尺寸由用户自己拖），并把宽度夹在 [COMPACT_MIN_W, COMPACT_W] 之间。
+#[tauri::command]
+fn set_float_width(window: tauri::WebviewWindow, width: f64) -> Result<(), String> {
+    if !PINNED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let w = width.clamp(COMPACT_MIN_W, COMPACT_W);
+    let (pw, ph) = physical_size(&window, w, COMPACT_H);
+    window
+        .set_size(tauri::PhysicalSize::new(pw, ph))
+        .map_err(|e| e.to_string())
+}
+
 /* ---------- 悬浮卡片右键菜单 ---------- */
 
 /// 悬浮卡片右键菜单的两个菜单项 id
@@ -1674,11 +1742,111 @@ fn show_window(window: tauri::WebviewWindow) -> Result<(), String> {
     window.show().map_err(|e| e.to_string())
 }
 
+/* ---------- 悬浮卡片悬停提示窗 ---------- */
+
+/// 提示窗尺寸（逻辑像素）与它和卡片之间的间距。
+/// 宽度固定，高度按内容自适应：各平台提示行数不同，固定 186 会让行数少的
+/// （比如 Trae 只有 4 行）下方空出一大块。TIP_H 只作为首帧兜底高度与上限。
+const TIP_W: f64 = 240.0;
+const TIP_H: f64 = 186.0;
+const TIP_MIN_H: f64 = 64.0;
+const TIP_GAP: f64 = 6.0;
+
+/// 上一次量到的提示内容高度（逻辑像素）。下次显示先用它开窗，
+/// 避免先按 186 开、再被前端量到的高度缩一下的可见跳动。
+static TIP_LAST_H: AtomicU32 = AtomicU32::new(186);
+
+/// 显示悬浮卡片的悬停提示窗。
+///
+/// 单独开一个窗口而不是在卡片窗口里画：卡片窗口只有 264x100，提示要挂在卡片上方、
+/// 内容比窗口还高，在原窗口里画一定会被裁掉。提示窗在 setup 里设了
+/// `ignore_cursor_events`，不接收任何鼠标事件，所以不会挡住它后面（桌面或其他应用）的点击。
+/// 内容由前端算好传进来（套餐 / 剩余 / 已用 / 预计可用天数等），这里只负责定位与显隐。
+#[tauri::command]
+fn show_float_tip(app: tauri::AppHandle, payload: serde_json::Value) -> Result<(), String> {
+    let main = app.get_webview_window("main").ok_or("找不到主窗口")?;
+    let tip = app.get_webview_window("tip").ok_or("找不到提示窗口")?;
+
+    let scale = main.scale_factor().map_err(|e| e.to_string())?;
+    let pos = main.outer_position().map_err(|e| e.to_string())?;
+    let size = main.outer_size().map_err(|e| e.to_string())?;
+
+    let tip_w = (TIP_W * scale).round() as u32;
+    let tip_h = (TIP_LAST_H.load(Ordering::Relaxed) as f64 * scale).round() as u32;
+    let gap = (TIP_GAP * scale).round() as i32;
+
+    let top = main
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.work_area().position.y)
+        .unwrap_or(0);
+
+    // 默认贴在卡片正上方；上方放不下就让到卡片下方
+    let mut y = pos.y - tip_h as i32 - gap;
+    if y < top {
+        y = pos.y + size.height as i32 + gap;
+    }
+    y = y.max(top);
+
+    let _ = tip.set_size(tauri::PhysicalSize::new(tip_w, tip_h));
+    let _ = tip.set_position(tauri::PhysicalPosition::new(pos.x, y));
+    // 先把内容推过去再显示，避免中间闪一帧空白
+    let _ = tip.emit("tip-data", payload);
+    tip.show().map_err(|e| e.to_string())
+}
+
+/// 提示窗按内容自适应高度：提示窗前端量出内容真实高度后回调（逻辑像素）。
+/// 宽度不变，只改高度，并按「贴卡片上方、放不下就挪到下方」的同一规则重新摆位，
+/// 免得收缩后位置跑偏。
+#[tauri::command]
+fn set_tip_height(app: tauri::AppHandle, height: f64) -> Result<(), String> {
+    let main = app.get_webview_window("main").ok_or("找不到主窗口")?;
+    let tip = app.get_webview_window("tip").ok_or("找不到提示窗口")?;
+
+    let scale = main.scale_factor().map_err(|e| e.to_string())?;
+    let pos = main.outer_position().map_err(|e| e.to_string())?;
+    let size = main.outer_size().map_err(|e| e.to_string())?;
+
+    let h = height.clamp(TIP_MIN_H, TIP_H);
+    TIP_LAST_H.store(h as u32, Ordering::Relaxed);
+
+    let tip_w = (TIP_W * scale).round() as u32;
+    let tip_h = (h * scale).round() as u32;
+    let gap = (TIP_GAP * scale).round() as i32;
+
+    let top = main
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.work_area().position.y)
+        .unwrap_or(0);
+
+    let mut y = pos.y - tip_h as i32 - gap;
+    if y < top {
+        y = pos.y + size.height as i32 + gap;
+    }
+    y = y.max(top);
+
+    let _ = tip.set_size(tauri::PhysicalSize::new(tip_w, tip_h));
+    let _ = tip.set_position(tauri::PhysicalPosition::new(pos.x, y));
+    Ok(())
+}
+
+/// 隐藏悬停提示窗（鼠标离开卡片、开始拖拽、退出悬浮态时调用）
+#[tauri::command]
+fn hide_float_tip(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(tip) = app.get_webview_window("tip") {
+        tip.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
             // 启动阶段零钥匙串访问：两次一次性迁移（明文→钥匙串、遗留服务名迁移）
-            // 已挪到「连接账号」解锁流程里执行，见 unlock_credentials。
+            // 已挪到「连接账号」按需解锁流程里执行，见 unlock_source。
 
             // Windows：子类化主窗口过程，为「定住」悬浮窗保留防最小化的能力
             #[cfg(target_os = "windows")]
@@ -1688,6 +1856,12 @@ fn main() {
                         float_guard::install(hwnd.0);
                     }
                 }
+            }
+
+            // 悬停提示窗：纯展示，不接收鼠标事件（不挡住后面的点击）、不抢焦点
+            if let Some(tip) = app.get_webview_window("tip") {
+                let _ = tip.set_ignore_cursor_events(true);
+                let _ = tip.set_focusable(false);
             }
 
             let Some(win) = app.get_webview_window("main") else {
@@ -1700,7 +1874,7 @@ fn main() {
                 if let Err(e) = apply_pinned_style(&win) {
                     eprintln!("恢复悬浮窗失败：{e}");
                 }
-                let (pos, size) = pinned_target(&win);
+                let (pos, size) = pinned_target(&win, None);
                 let _ = win.set_size(tauri::PhysicalSize::new(size.0, size.1));
                 let _ = win.set_position(tauri::PhysicalPosition::new(pos.0, pos.1));
                 #[cfg(target_os = "windows")]
@@ -1736,12 +1910,16 @@ fn main() {
             set_refresh_interval,
             get_source_data,
             test_source,
-            unlock_credentials,
+            unlock_source,
             open_url,
             set_pinned,
+            set_float_width,
+            set_tip_height,
             show_card_menu,
             startup_state,
-            show_window
+            show_window,
+            show_float_tip,
+            hide_float_tip
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1785,15 +1963,15 @@ mod tests {
         );
     }
 
-    /// 锁定态（默认）：读钥匙串的函数必须直接返回 None，绝不调用 keyring，
+    /// 未解锁任何源（默认）：读钥匙串的函数必须直接返回 None，绝不调用 keyring，
     /// 因此启动过程不会触碰钥匙串、不会弹出 macOS 授权框。
     #[test]
     fn locked_reads_skip_keychain() {
-        assert!(!creds_unlocked(), "会话解锁闸门默认应为锁定态");
-        // 未解锁时读取「直接返回空」，函数体内不会调用 keyring（否则真机会弹授权框）
+        assert!(!source_unlocked("deepseek"), "会话解锁集合默认应为空");
+        // 未解锁的源读取「直接返回空」，函数体内不会调用 keyring（否则真机会弹授权框）
         assert!(
             read_keychain_creds("deepseek").is_none(),
-            "锁定态读钥匙串应返回 None"
+            "未解锁的源读钥匙串应返回 None"
         );
     }
 }

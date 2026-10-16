@@ -46,6 +46,13 @@
           sub: subs.join(" · "),
           reset: available ? "" : "账户不可用",
           pct: null,
+          // 悬停提示窗：余额类场景按「余额 ÷ 日均消耗」估算可用天数
+          title: "DeepSeek 余额",
+          remainNum: total,
+          tip: [
+            ...(topped !== null ? [["充值余额", `${fmtNum(topped)} ${currency}`]] : []),
+            ...(granted !== null ? [["赠送余额", `${fmtNum(granted)} ${currency}`]] : []),
+          ],
         },
       };
     },
