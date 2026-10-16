@@ -41,7 +41,9 @@
         border-radius: 14px;
         border: 1px solid var(--tip-border);
         background: var(--tip-bg);
-        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+        /* 投影交给窗口原生的 NSWindow 阴影（tauri.conf.json 里 tip 的 shadow: true）。
+           这里不能用 CSS box-shadow：窗口高度正好等于内容高度，投影落在窗口外的部分
+           会被直接裁掉，只在圆角切角那一圈露出灰边，看着像脏了的方块。 */
         display: flex;
         flex-direction: column;
         color: var(--tip-text);

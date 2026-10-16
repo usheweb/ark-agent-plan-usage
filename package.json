@@ -1,7 +1,7 @@
 {
   "name": "tangsanlang-float",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "把各 AI 服务商的余额 / 用量聚合在一个常驻悬浮窗里：Trae 积分、火山方舟 Agent Plan、DeepSeek、Kimi 月之暗面、硅基流动",
   "license": "MIT",
   "scripts": {

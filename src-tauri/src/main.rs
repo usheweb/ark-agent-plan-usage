@@ -1706,7 +1706,18 @@ fn set_float_width(window: tauri::WebviewWindow, width: f64) -> Result<(), Strin
     let (pw, ph) = physical_size(&window, w, COMPACT_H);
     window
         .set_size(tauri::PhysicalSize::new(pw, ph))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // 提示窗宽度跟卡片走：数字位数变化会改卡片宽度，提示窗开着时也得跟着改，
+    // 否则会和卡片左右错开
+    if let Some(tip) = window.app_handle().get_webview_window("tip") {
+        if tip.is_visible().unwrap_or(false) {
+            let scale = window.scale_factor().map_err(|e| e.to_string())?;
+            let tip_h = (TIP_LAST_H.load(Ordering::Relaxed) as f64 * scale).round() as u32;
+            let _ = place_tip(&window, &tip, tip_h);
+        }
+    }
+    Ok(())
 }
 
 /* ---------- 悬浮卡片右键菜单 ---------- */
@@ -1745,9 +1756,9 @@ fn show_window(window: tauri::WebviewWindow) -> Result<(), String> {
 /* ---------- 悬浮卡片悬停提示窗 ---------- */
 
 /// 提示窗尺寸（逻辑像素）与它和卡片之间的间距。
-/// 宽度固定，高度按内容自适应：各平台提示行数不同，固定 186 会让行数少的
+/// 宽度不写死：直接取悬浮卡窗口当前的宽度，提示窗才能和卡片左右对齐、宽窄一致
+/// （见 place_tip）。高度按内容自适应：各平台提示行数不同，固定 186 会让行数少的
 /// （比如 Trae 只有 4 行）下方空出一大块。TIP_H 只作为首帧兜底高度与上限。
-const TIP_W: f64 = 240.0;
 const TIP_H: f64 = 186.0;
 const TIP_MIN_H: f64 = 64.0;
 const TIP_GAP: f64 = 6.0;
@@ -1755,6 +1766,38 @@ const TIP_GAP: f64 = 6.0;
 /// 上一次量到的提示内容高度（逻辑像素）。下次显示先用它开窗，
 /// 避免先按 186 开、再被前端量到的高度缩一下的可见跳动。
 static TIP_LAST_H: AtomicU32 = AtomicU32::new(186);
+
+/// 把提示窗摆到卡片正上方（上方放不下就挪到下方）。
+/// 宽度直接取悬浮卡窗口的宽度——卡片本来就是按内容自适应的，
+/// 提示窗跟着它走，两者左右对齐、宽窄一致。
+fn place_tip(
+    main: &tauri::WebviewWindow,
+    tip: &tauri::WebviewWindow,
+    height: u32,
+) -> Result<(), String> {
+    let scale = main.scale_factor().map_err(|e| e.to_string())?;
+    let pos = main.outer_position().map_err(|e| e.to_string())?;
+    let size = main.outer_size().map_err(|e| e.to_string())?;
+
+    let gap = (TIP_GAP * scale).round() as i32;
+
+    let top = main
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.work_area().position.y)
+        .unwrap_or(0);
+
+    let mut y = pos.y - height as i32 - gap;
+    if y < top {
+        y = pos.y + size.height as i32 + gap;
+    }
+    y = y.max(top);
+
+    let _ = tip.set_size(tauri::PhysicalSize::new(size.width, height));
+    let _ = tip.set_position(tauri::PhysicalPosition::new(pos.x, y));
+    Ok(())
+}
 
 /// 显示悬浮卡片的悬停提示窗。
 ///
@@ -1768,69 +1811,27 @@ fn show_float_tip(app: tauri::AppHandle, payload: serde_json::Value) -> Result<(
     let tip = app.get_webview_window("tip").ok_or("找不到提示窗口")?;
 
     let scale = main.scale_factor().map_err(|e| e.to_string())?;
-    let pos = main.outer_position().map_err(|e| e.to_string())?;
-    let size = main.outer_size().map_err(|e| e.to_string())?;
-
-    let tip_w = (TIP_W * scale).round() as u32;
     let tip_h = (TIP_LAST_H.load(Ordering::Relaxed) as f64 * scale).round() as u32;
-    let gap = (TIP_GAP * scale).round() as i32;
 
-    let top = main
-        .current_monitor()
-        .ok()
-        .flatten()
-        .map(|m| m.work_area().position.y)
-        .unwrap_or(0);
-
-    // 默认贴在卡片正上方；上方放不下就让到卡片下方
-    let mut y = pos.y - tip_h as i32 - gap;
-    if y < top {
-        y = pos.y + size.height as i32 + gap;
-    }
-    y = y.max(top);
-
-    let _ = tip.set_size(tauri::PhysicalSize::new(tip_w, tip_h));
-    let _ = tip.set_position(tauri::PhysicalPosition::new(pos.x, y));
+    place_tip(&main, &tip, tip_h)?;
     // 先把内容推过去再显示，避免中间闪一帧空白
     let _ = tip.emit("tip-data", payload);
     tip.show().map_err(|e| e.to_string())
 }
 
 /// 提示窗按内容自适应高度：提示窗前端量出内容真实高度后回调（逻辑像素）。
-/// 宽度不变，只改高度，并按「贴卡片上方、放不下就挪到下方」的同一规则重新摆位，
-/// 免得收缩后位置跑偏。
+/// 宽度跟卡片走、位置按同一规则重摆，都交给 place_tip；这里只更新高度。
 #[tauri::command]
 fn set_tip_height(app: tauri::AppHandle, height: f64) -> Result<(), String> {
     let main = app.get_webview_window("main").ok_or("找不到主窗口")?;
     let tip = app.get_webview_window("tip").ok_or("找不到提示窗口")?;
 
-    let scale = main.scale_factor().map_err(|e| e.to_string())?;
-    let pos = main.outer_position().map_err(|e| e.to_string())?;
-    let size = main.outer_size().map_err(|e| e.to_string())?;
-
     let h = height.clamp(TIP_MIN_H, TIP_H);
     TIP_LAST_H.store(h as u32, Ordering::Relaxed);
 
-    let tip_w = (TIP_W * scale).round() as u32;
+    let scale = main.scale_factor().map_err(|e| e.to_string())?;
     let tip_h = (h * scale).round() as u32;
-    let gap = (TIP_GAP * scale).round() as i32;
-
-    let top = main
-        .current_monitor()
-        .ok()
-        .flatten()
-        .map(|m| m.work_area().position.y)
-        .unwrap_or(0);
-
-    let mut y = pos.y - tip_h as i32 - gap;
-    if y < top {
-        y = pos.y + size.height as i32 + gap;
-    }
-    y = y.max(top);
-
-    let _ = tip.set_size(tauri::PhysicalSize::new(tip_w, tip_h));
-    let _ = tip.set_position(tauri::PhysicalPosition::new(pos.x, y));
-    Ok(())
+    place_tip(&main, &tip, tip_h)
 }
 
 /// 隐藏悬停提示窗（鼠标离开卡片、开始拖拽、退出悬浮态时调用）
