@@ -334,9 +334,9 @@ async function refresh(manual = false) {
     lockedScene = false;
     setStatus("err", "获取失败");
     showError(String(e));
-    el.cards.innerHTML = `<div class="empty">暂无数据</div>`;
-    lastFloat = null;
-    updateFloat();
+    // 刷新失败不清空已有数据：悬浮卡与主视图保留上一次成功的结果，
+    // 错误交给顶部状态与错误横幅表达，避免网络抖一下悬浮窗就变成空「—」卡；
+    // 提示窗里的「更新于」停留在上次成功时间，可据此判断数据新旧
   } finally {
     loading = false;
     el.refreshBtn.classList.remove("spinning");
