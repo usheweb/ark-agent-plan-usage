@@ -222,6 +222,8 @@ let bootFitted = false;
 async function fitWindowHeight(force = false, floor = 0) {
   if (document.body.classList.contains("pinned")) return;
   if (settingsOpen()) return;
+  // 定住 / 取消定住的动画期间窗口尺寸正在被动画接管，别去抢
+  if (pinAnimating) return;
   let h = measureContentHeight();
   if (!h) return;
   if (floor) h = Math.max(h, floor);
@@ -778,12 +780,28 @@ document.addEventListener("keydown", (e) => {
 // 窗口会播放约 180ms 的缩放动画，期间忽略重复点击，避免状态错乱
 let pinBusy = false;
 
+/// 是否正处于定住 / 取消定住的过渡动画期间。
+/// 收缩动画里窗口会从鼠标底下扫过，若不抑制，mouseenter 会触发 tip 弹出造成抖动；
+/// 高度贴合这时也在跟动画抢窗口尺寸，一并停掉。
+let pinAnimating = false;
+let pinAnimatingTimer = 0;
+function beginPinAnimation(ms = 300) {
+  pinAnimating = true;
+  clearTimeout(pinAnimatingTimer);
+  // 定住方向 Rust 侧动画约 180ms，留点余量；取消定住方向 Rust 要先等标题栏恢复
+  // （最长约 600ms）再播动画，抑制窗要盖到整段过渡结束，见 setPinned(false)
+  pinAnimatingTimer = setTimeout(() => {
+    pinAnimating = false;
+  }, ms);
+}
+
 async function setPinned(on) {
   if (pinBusy) return;
   pinBusy = true;
   setTimeout(() => {
     pinBusy = false;
   }, 500);
+  beginPinAnimation();
   try {
     if (on) {
       closeSettings();
@@ -797,14 +815,25 @@ async function setPinned(on) {
     } else {
       // 退出悬浮态时一并收起提示窗（Rust 侧也会收，这里先收掉避免闪一下）
       hideTip();
+      // 取消定住的整段过渡（等标题栏 + 动画）最长约 800ms，这期间窗口还是窄尺寸：
+      // 抑制 tip 弹出，也抑制高度贴合（贴合会保持当前窄宽度，把窄宽度固化下来）
+      beginPinAnimation(1000);
       // 趁还在定住态先量主视图贴合高度（摘 class → 量 → 还原，同一任务内完成不会重绘），
-      // 让 Rust 的取消定住动画直接落到这个高度，落地后不再二次调高
+      // 让 Rust 的取消定住动画直接落到这个高度，落地后不再二次调高。
+      // 注意量之前把 body 临时固定到普通窗宽 420px：此刻窗口还是悬浮态的窄宽度，
+      // 按窄宽度量会让卡片文字换行更多、高度偏大，回到 420 宽后底部就多出空白
       document.body.classList.remove("pinned");
+      const prevBodyW = document.body.style.width;
+      document.body.style.width = "420px";
       const h = measureContentHeight();
+      document.body.style.width = prevBodyW;
       document.body.classList.add("pinned");
       lastFitH = h;
       bootFitted = true;
       await invoke("set_pinned", { on, height: h || null });
+      // 兜底：等 Rust 的取消定住动画完全落地后（含等标题栏的时间）再用最终布局量一次，
+      // 偏差超过阈值就纠正（量准则无动作）。太早量会量到过渡中的窄宽度
+      setTimeout(() => fitWindowHeight(true), 1000);
     }
   } catch (e) {
     if (on) document.body.classList.remove("pinned");
@@ -891,6 +920,8 @@ function buildTipPayload() {
 
 async function showTip() {
   if (!document.body.classList.contains("pinned")) return;
+  // 过渡动画期间窗口在鼠标底下扫过，此时弹 tip 会造成抖动，跳过
+  if (pinAnimating) return;
   const payload = buildTipPayload();
   if (!payload) return;
   tipShown = true;

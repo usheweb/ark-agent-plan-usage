@@ -189,13 +189,14 @@
           reset: "",
           pct,
           color,
-          // 悬停提示窗：剩余行由前端按 remain/unit 统一补，这里只给套餐与已用；
-          // 可用天数与重置日期已经落在卡片第三行（见上面的 sub），这里不再重复
+          // 悬停提示窗：剩余行由前端按 remain/unit 统一补，这里给套餐、已用与预计剩余天数
+          // （天数行用 accent 强调色，见 tooltip.html 的 .tip-row.accent）
           title: "TRAE 积分余额",
           remainNum: agg.remaining,
           tip: [
             ["套餐", identity || "—"],
             ["已用", `${fmtNum(agg.used)} / ${fmtNum(agg.total)}`],
+            ["预计剩余", daysText, "accent"],
           ],
         },
       };

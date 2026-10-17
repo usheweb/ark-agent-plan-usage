@@ -1479,6 +1479,11 @@ static PINNED: AtomicBool = AtomicBool::new(false);
 /// 避免「关窗转定住」的拦截把退出卡住
 static EXITING: AtomicBool = AtomicBool::new(false);
 
+/// 取消定住的过渡是否还在进行：线程里要先等标题栏恢复（最长约 600ms）再播 180ms 动画，
+/// 这期间窗口仍是悬浮态的窄尺寸，若放任高度贴合插进来，它会「保持当前宽度」把窄宽度固化下来，
+/// 覆盖掉动画的落点。贴合请求在这期间直接丢弃，动画结束后前端会再补一次兜底贴合。
+static UNPIN_ANIMATING: AtomicBool = AtomicBool::new(false);
+
 /// 写入「定住」状态与悬浮窗坐标（`pos` 为 None 时保留原有的坐标）
 fn persist_pin_state(app: &tauri::AppHandle, pinned: bool, pos: Option<(i32, i32)>) {
     let mut settings = read_settings(app);
@@ -1660,6 +1665,7 @@ async fn set_pinned(
         // 注意：动画期间保持悬浮态的最小尺寸（COMPACT_MIN），否则从 236x100 放大到 420x500
         // 的中间帧都小于 380x240，会被系统 min_size 钳制导致动画失效；等动画结束再放开。
         let w = window.clone();
+        UNPIN_ANIMATING.store(true, Ordering::Relaxed);
         std::thread::spawn(move || {
             let _ = w.set_decorations(true);
             // set_decorations 的 styleMask 是异步生效的：轮询「外框 - 内尺寸」的差值，
@@ -1709,6 +1715,7 @@ async fn set_pinned(
             // 动画结束后再放开最小尺寸与可缩放
             let _ = w.set_min_size(Some(tauri::LogicalSize::new(NORMAL_MIN_W, NORMAL_MIN_H)));
             let _ = w.set_resizable(true);
+            UNPIN_ANIMATING.store(false, Ordering::Relaxed);
         });
     }
     Ok(())
@@ -1725,6 +1732,10 @@ async fn fit_window_height(
     animate: bool,
 ) -> Result<(), String> {
     if PINNED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    // 取消定住的过渡期：窗口还是悬浮态窄尺寸，此刻贴合会把窄宽度固化，直接丢弃
+    if UNPIN_ANIMATING.load(Ordering::Relaxed) {
         return Ok(());
     }
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
