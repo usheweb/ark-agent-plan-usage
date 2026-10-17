@@ -132,33 +132,57 @@
           <div id="source-list" class="source-list"></div>
         </div>
 
-        <!-- 视图二：某个平台的凭证表单（字段由后端下发的 schema 动态生成） -->
+        <!-- 视图二：某个平台的账号管理（账号列表 + 新增 / 编辑账号表单） -->
         <div id="settings-detail-view" class="hidden">
-          <p class="modal-desc" id="detail-desc"></p>
-          <div id="detail-fields"></div>
+          <!-- 自动凭证源（Trae）的只读检测信息；手动凭证平台为空 -->
+          <div id="detail-info"></div>
 
-          <!-- 刷新间隔不属于凭证，单独渲染：按场景各自保存（E-02） -->
-          <div class="field">
-            <span class="field-label">自动刷新间隔（秒）</span>
-            <input
-              id="detail-interval"
-              type="number"
-              min="5"
-              max="3600"
-              step="5"
-              inputmode="numeric"
-              autocomplete="off"
-            />
+          <p class="modal-desc" id="detail-desc"></p>
+
+          <!-- 该平台已有的账号列表：可设为当前 / 编辑 / 删除 -->
+          <div id="account-list" class="account-list"></div>
+          <button type="button" class="ghost-btn account-add" id="account-add">
+            + 新增账号
+          </button>
+
+          <!-- 账号表单（新增或编辑）：账号名 + 平台凭证字段 + 刷新间隔 -->
+          <div id="account-form" class="hidden">
+            <div class="field">
+              <span class="field-label">账号名称</span>
+              <input
+                id="detail-label"
+                type="text"
+                maxlength="24"
+                placeholder="留空则用「默认账号」"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+            <div id="detail-fields"></div>
+
+            <!-- 刷新间隔按账号各自保存 -->
+            <div class="field">
+              <span class="field-label">自动刷新间隔（秒）</span>
+              <input
+                id="detail-interval"
+                type="number"
+                min="5"
+                max="3600"
+                step="5"
+                inputmode="numeric"
+                autocomplete="off"
+              />
+            </div>
           </div>
 
           <div id="settings-msg" class="settings-msg hidden"></div>
 
           <div class="modal-foot">
             <button class="ghost-btn" id="detail-back" type="button">返回</button>
-            <button class="ghost-btn danger" id="detail-clear" type="button">清除本机凭证</button>
+            <button class="ghost-btn hidden" id="detail-cancel" type="button">取消</button>
             <span class="spacer"></span>
-            <button class="ghost-btn" id="detail-test" type="button">测试连接</button>
-            <button class="primary-btn" id="detail-save" type="button">保存并切换</button>
+            <button class="ghost-btn hidden" id="detail-test" type="button">测试连接</button>
+            <button class="primary-btn hidden" id="detail-save" type="button">保存</button>
           </div>
         </div>
       </div>

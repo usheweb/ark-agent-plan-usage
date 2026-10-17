@@ -52,10 +52,15 @@ const el = {
   detailView: document.getElementById("settings-detail-view"),
   sourceList: document.getElementById("source-list"),
   detailDesc: document.getElementById("detail-desc"),
+  detailInfo: document.getElementById("detail-info"),
+  accountList: document.getElementById("account-list"),
+  accountAdd: document.getElementById("account-add"),
+  accountForm: document.getElementById("account-form"),
+  detailLabel: document.getElementById("detail-label"),
   detailFields: document.getElementById("detail-fields"),
   detailInterval: document.getElementById("detail-interval"),
   detailBack: document.getElementById("detail-back"),
-  detailClear: document.getElementById("detail-clear"),
+  detailCancel: document.getElementById("detail-cancel"),
   detailTest: document.getElementById("detail-test"),
   detailSave: document.getElementById("detail-save"),
 };
@@ -64,7 +69,7 @@ let loading = false;
 /// 当前场景交给悬浮窗的文案；为 null 表示该场景没有可展示的悬浮信息
 let lastFloat = null;
 
-/// 每个数据源「上一次成功渲染的结果」（按源分开存，切 tab 不会串台）。
+/// 每个账号「上一次成功渲染的结果」（按账号 id 分开存，切 tab 不会串台）。
 /// 取数失败时不把已有的数据换成空占位，改用这里的旧结果顶上；同时落一份到
 /// localStorage，这样冷启动时第一次取数就失败，也还能看到上一次的数据。
 const LAST_GOOD_KEY = "afp:lastGood";
@@ -101,26 +106,58 @@ function applyCachedView(view) {
   return true;
 }
 
-/// 后端下发的数据源清单，以及当前正在编辑 / 正在展示的平台
+/// 后端下发的平台清单（每个平台内含它自己的账号列表）
 let catalog = [];
-let activeSource = null;
+/// 当前正在展示的账号 id（形如 aliyun:1）；trae 这类自动凭证源就是 "trae"
+let activeAccount = null;
 /// 凭证存放方式（后端下发）：keychain = 系统钥匙串，file = 明文文件兜底
 let credStorage = "keychain";
 let credPath = "";
+/// 设置里当前打开的平台（只存 id，取最新对象用 currentDef()）
 let currentSource = null;
+/// 设置里正在编辑的账号 id；null 表示「新增账号」
+let editingAccountId = null;
+/// 编辑表单被锁定（该账号已保存凭证但本次运行尚未连接）：隐藏保存 / 测试，避免覆盖旧密钥
+let formLocked = false;
 
-/// 当前展示的场景是否为「未解锁」的钥匙串源（决定悬浮窗是否显示待授权入口）
+/// 当前展示的账号是否为「未解锁」的钥匙串账号（决定悬浮窗是否显示待授权入口）
 let lockedScene = false;
 
-/// 某数据源本次运行是否可立即取数：auto 源看「本机登录态可用」，钥匙串源看「本次是否已连接」
-function sourceReady(id) {
-  const s = catalog.find((x) => x.id === id);
-  return !!s && s.ready === true;
+/// 把清单里所有平台的账号拍平成一个列表：[{ account, source }]
+function accountEntries() {
+  const out = [];
+  for (const s of catalog) for (const a of s.accounts || []) out.push({ account: a, source: s });
+  return out;
 }
 
-/// 当前场景是否可立即取数（未连接时既不取数、也不启动自动刷新）
+/// 按账号 id 找到它所属的平台
+function entryById(id) {
+  if (!id) return null;
+  return accountEntries().find((e) => e.account.id === id) || null;
+}
+
+/// 账号在 Tab / 列表上的显示名：自动凭证源用平台名，其余用「平台名 · 账号名」
+function entryLabel(e) {
+  if (!e) return "—";
+  if (e.source.autoCreds) return e.source.name;
+  const label = (e.account.label || "").trim() || "默认账号";
+  return `${e.source.name} · ${label}`;
+}
+
+/// 设置里当前打开的平台定义（用 id 重新解析，避免拿到 reloadCatalog 前的旧对象）
+function currentDef() {
+  if (!currentSource) return null;
+  return catalog.find((s) => s.id === currentSource.id) || null;
+}
+
+/// 某账号本次运行是否可立即取数：auto 源看「本机登录态可用」，钥匙串账号看「本次是否已连接」
+function accountReady(id) {
+  return entryById(id)?.account.ready === true;
+}
+
+/// 当前账号是否可立即取数（未连接时既不取数、也不启动自动刷新）
 function activeReady() {
-  return !!activeSource && sourceReady(activeSource);
+  return !!activeAccount && accountReady(activeAccount);
 }
 
 /* ---------- 通用 ---------- */
@@ -281,8 +318,9 @@ async function fitWindowHeight(force = false, floor = 0) {
 /// 返回 true 表示本次没取到真实数据（渲染失败或接口返回空），当前展示的是上一次的结果
 function renderResult(res) {
   lockedScene = false;
-  const id = res?.source;
-  const mod = (window.AFP_SOURCES || {})[id];
+  // 按账号 id 缓存：同一平台的不同账号各自保留自己的上一次结果
+  const id = res?.account || res?.source;
+  const mod = (window.AFP_SOURCES || {})[res?.source];
   let view = null;
   try {
     view = mod ? mod.render(res?.data) : null;
@@ -318,31 +356,32 @@ function renderResult(res) {
 function renderLocked() {
   lockedScene = true;
   el.badge.textContent = "待授权";
-  const nm = catalog.find((s) => s.id === activeSource)?.name || "该平台";
+  const nm = entryById(activeAccount)?.source.name || "该平台";
   el.cards.innerHTML = `
     <div class="connect-card">
       <div class="connect-title">连接 ${nm}</div>
-      <p class="connect-desc">「${nm}」的凭证存在系统钥匙串里。点击后 macOS 会请求钥匙串授权，一次性读取所有已保存平台的密钥并加载数据；此后切换其他 tab 不再重复请求。授权仅在本次运行内有效。</p>
+      <p class="connect-desc">「${nm}」的凭证存在系统钥匙串里。点击后 macOS 会请求钥匙串授权，一次性读取所有已保存账号的密钥并加载数据；此后切换其他 tab 不再重复请求。授权仅在本次运行内有效。</p>
       <button type="button" class="primary-btn connect-btn" id="connect-btn">连接账号</button>
     </div>`;
   el.cards
     .querySelector("#connect-btn")
-    .addEventListener("click", () => connectSource(activeSource));
+    .addEventListener("click", () => connectAccount(activeAccount));
   lastFloat = null;
   updateFloat();
 }
 
-/// 按需连接某个数据源：请求钥匙串授权 → 读取该源密钥 → 重新加载清单与数据 → 启动刷新
-async function connectSource(id) {
-  const sid = id || activeSource;
-  if (!sid) return;
+/// 按需连接某个账号：请求钥匙串授权 → 读取全部账号密钥 → 重新加载清单与数据 → 启动刷新
+async function connectAccount(id) {
+  const acc = id || activeAccount;
+  if (!acc) return;
   const btn = document.getElementById("connect-btn");
   if (btn) {
     btn.disabled = true;
     btn.textContent = "连接中…";
   }
   try {
-    await invoke("unlock_source", { sourceId: sid });
+    // 后端做的是「全量解锁」：一次授权读所有已保存账号，之后切换账号不再弹框
+    await invoke("unlock_accounts", { accountId: acc });
     await reloadCatalog();
     await refresh(true);
   } catch (e) {
@@ -365,7 +404,8 @@ async function refresh(manual = false) {
   if (floatBusy) el.floatSub.textContent = "刷新中…";
 
   try {
-    const res = await invoke("get_source_data");
+    // 显式带上账号 id：避免切换瞬间「当前账号」还没落盘时取错数据
+    const res = await invoke("get_source_data", activeAccount ? { accountId: activeAccount } : {});
     el.subtitle.textContent = res?.subtitle || res?.name || "—";
     if (res?.state === "locked") {
       // 待授权：不是错误，主视图给「连接账号」入口
@@ -391,7 +431,7 @@ async function refresh(manual = false) {
     // 取数失败不显示空占位：回落到这个源上一次的成功结果（本次运行或上次运行存的），
     // 一次都没成功过才给占位文案。错误交给顶部状态与红色横幅表达，提示窗里的
     // 「更新于」停留在上次成功时间，可据此判断数据新旧。
-    if (!applyCachedView(activeSource && lastGoodViews[activeSource])) {
+    if (!applyCachedView(activeAccount && lastGoodViews[activeAccount])) {
       el.cards.innerHTML = `<div class="empty">暂无数据</div>`;
       el.badge.textContent = "—";
       lastFloat = null;
@@ -416,16 +456,16 @@ function updateCountdown() {
 }
 
 el.refreshBtn.addEventListener("click", () => refresh(true));
-el.connectSm.addEventListener("click", () => connectSource(activeSource));
+el.connectSm.addEventListener("click", () => connectAccount(activeAccount));
 
-/* ---------- 场景 Tab（M-05）+ 每场景刷新间隔（E-02） ---------- */
+/* ---------- 账号 Tab（M-05）+ 每账号刷新间隔（E-02） ---------- */
 
-/// 只给「已配置」的平台建 Tab：未配置的平台在设置里录入后才出现
+/// 只给「已配置」的账号建 Tab（含 trae 这条自动凭证条目）：未配置的账号在设置里录入后才出现
 function renderTabs() {
-  const configured = catalog.filter((s) => s.configured);
+  const configured = accountEntries().filter((e) => e.account.configured);
   el.tabs.innerHTML = "";
 
-  // 只有一个已配置平台时 Tab 没有切换意义，收起把纵向空间还给内容
+  // 只有一个已配置账号时 Tab 没有切换意义，收起把纵向空间还给内容
   if (configured.length < 2) {
     el.tabs.classList.add("hidden");
     fitWindowHeight();
@@ -433,19 +473,20 @@ function renderTabs() {
   }
   el.tabs.classList.remove("hidden");
 
-  for (const s of configured) {
+  for (const e of configured) {
     const tab = document.createElement("button");
     tab.type = "button";
-    tab.className = "tab" + (s.id === activeSource ? " active" : "");
-    tab.textContent = s.name;
-    tab.addEventListener("click", () => switchSource(s.id));
+    tab.className = "tab" + (e.account.id === activeAccount ? " active" : "");
+    tab.textContent = entryLabel(e);
+    tab.title = entryLabel(e);
+    tab.addEventListener("click", () => switchAccount(e.account.id));
     el.tabs.appendChild(tab);
   }
   fitWindowHeight();
 }
 
-/// 取当前场景配置的刷新间隔，并重建自动刷新定时器。
-/// 当前场景未连接（钥匙串源未解锁）时不启动定时器，倒计时位置显示「待连接」（no-op，不刷出错误）。
+/// 取当前账号配置的刷新间隔，并重建自动刷新定时器。
+/// 当前账号未连接（钥匙串未解锁）时不启动定时器，倒计时位置显示「待连接」（no-op，不刷出错误）。
 function applyRefreshInterval() {
   if (autoTimer) clearInterval(autoTimer);
   autoTimer = null;
@@ -459,28 +500,27 @@ function applyRefreshInterval() {
 
   el.connectSm.classList.add("hidden");
 
-  const cur = catalog.find((s) => s.id === activeSource);
-  refreshInterval = cur?.interval || defaultInterval;
+  refreshInterval = entryById(activeAccount)?.account.interval || defaultInterval;
   secondsLeft = refreshInterval;
   updateCountdown();
 
   autoTimer = setInterval(() => refresh(false), refreshInterval * 1000);
 }
 
-async function switchSource(id) {
-  if (id === activeSource) return;
-  activeSource = id;
+async function switchAccount(id) {
+  if (id === activeAccount) return;
+  activeAccount = id;
   renderTabs();
   applyRefreshInterval();
   try {
-    await invoke("set_active_source", { sourceId: id });
+    await invoke("set_active_account", { accountId: id });
   } catch (e) {
     showError(String(e));
   }
   // 切到需要凭证的 tab：此刻才读钥匙串（懒加载）。未连接才请求授权，已连接直接取数。
-  const def = catalog.find((s) => s.id === id);
-  if (def && !def.autoCreds && !def.ready) {
-    await connectSource(id);
+  const e = entryById(id);
+  if (e && !e.source.autoCreds && !e.account.ready) {
+    await connectAccount(id);
     return;
   }
   await refresh(true);
@@ -506,15 +546,32 @@ function settingsOpen() {
 function showView(name) {
   el.listView.classList.toggle("hidden", name !== "list");
   el.detailView.classList.toggle("hidden", name !== "detail");
-  el.settingsTitle.textContent = name === "detail" ? currentSource?.name || "数据源" : "数据源";
+  el.settingsTitle.textContent = name === "detail" ? currentDef()?.name || "数据源" : "数据源";
 }
 
 /// 凭证放在哪儿，由后端下发的 storage 决定（E-01）
 function renderStorageDesc() {
   el.storageDesc.textContent =
     credStorage === "keychain"
-      ? "凭证保存在系统钥匙串（macOS Keychain / Windows 凭据管理器），不落到明文文件。点击平台录入它自己的密钥，保存后即切换为该场景。"
-      : `凭证以明文保存在本机（${credPath}），因为当前系统钥匙串不可用。点击平台录入它自己的密钥，保存后即切换为该场景。`;
+      ? "凭证保存在系统钥匙串（macOS Keychain / Windows 凭据管理器），不落到明文文件。同一平台可保存多个账号，点平台进去各自录入。"
+      : `凭证以明文保存在本机（${credPath}），因为当前系统钥匙串不可用。同一平台可保存多个账号，点平台进去各自录入。`;
+}
+
+/// 平台行的状态：按它下面所有账号汇总出「最能代表该平台」的一句话
+function platformState(s) {
+  const accs = s.accounts || [];
+  if (s.autoCreds) {
+    const ok = !!accs[0]?.configured;
+    return { text: ok ? "可用" : "不可用", tone: ok ? "ok" : "" };
+  }
+  const n = accs.length;
+  if (!n) return { text: "未配置", tone: "" };
+  const ready = accs.filter((a) => a.ready).length;
+  const saved = accs.filter((a) => a.hasCreds).length;
+  if (ready === n) return { text: `已配置 ${n} 个账号`, tone: "ok" };
+  // 有凭证但本次运行还没连接：不能显示成「未配置」，否则会诱导用户重录
+  if (saved > ready) return { text: `已保存 ${n} 个 · 待连接`, tone: "warn" };
+  return { text: `已配置 ${ready}/${n} 个账号`, tone: "ok" };
 }
 
 function renderSourceList() {
@@ -525,9 +582,10 @@ function renderSourceList() {
   }
 
   for (const s of catalog) {
+    const isCurrent = (s.accounts || []).some((a) => a.id === activeAccount);
     const row = document.createElement("button");
     row.type = "button";
-    row.className = "source-row" + (s.id === activeSource ? " current" : "");
+    row.className = "source-row" + (isCurrent ? " current" : "");
 
     const main = document.createElement("span");
     main.className = "source-row-main";
@@ -539,24 +597,10 @@ function renderSourceList() {
     sub.textContent = s.subtitle;
     main.append(name, sub);
 
+    const st = platformState(s);
     const state = document.createElement("span");
-    let stateText;
-    let ok = false;
-    if (s.autoCreds) {
-      stateText = s.configured ? (s.id === activeSource ? "当前 · 可用" : "可用") : "不可用";
-      ok = !!s.configured;
-    } else if (s.ready) {
-      stateText = s.id === activeSource ? "当前 · 已配置" : "已配置";
-      ok = true;
-    } else if (s.hasCreds) {
-      // 已保存但未连接：不能显示成「未配置」，否则会诱导用户重录
-      stateText = "已保存 · 待连接";
-    } else {
-      stateText = "未配置";
-    }
-    state.className =
-      "source-row-state" + (ok ? " ok" : s.hasCreds && !s.unlocked ? " warn" : "");
-    state.textContent = stateText;
+    state.className = "source-row-state" + (st.tone ? " " + st.tone : "");
+    state.textContent = st.text;
 
     row.append(main, state);
     row.addEventListener("click", () => openDetail(s.id));
@@ -567,7 +611,7 @@ function renderSourceList() {
 async function reloadCatalog() {
   const res = await invoke("list_sources");
   catalog = res?.sources || [];
-  activeSource = res?.active || null;
+  activeAccount = res?.active || null;
   credStorage = res?.storage === "file" ? "file" : "keychain";
   credPath = res?.path || "";
   renderStorageDesc();
@@ -585,7 +629,7 @@ async function openSettings() {
     await reloadCatalog();
   } catch (e) {
     catalog = [];
-    activeSource = null;
+    activeAccount = null;
     renderSourceList();
     el.sourceList.innerHTML = `<div class="empty">读取数据源失败</div>`;
     console.error(e);
@@ -600,6 +644,8 @@ function closeSettings() {
   el.settingsModal.classList.add("hidden");
   setSettingsMsg("", "");
   currentSource = null;
+  editingAccountId = null;
+  formLocked = false;
   fitWindowHeight(true);
 }
 
@@ -617,20 +663,22 @@ function helpLink(def) {
   return a;
 }
 
-/// 按当前平台的字段 schema 生成表单（含密文字段的显示 / 隐藏切换）
+/// 打开某个平台的账号管理页：账号列表 + 新增 / 编辑 / 删除 / 设为当前
 function openDetail(id) {
-  const def = catalog.find((s) => s.id === id);
-  if (!def) return;
-  currentSource = def;
+  if (!catalog.find((s) => s.id === id)) return;
+  currentSource = { id };
+  closeAccountForm();
   setSettingsMsg("", "");
+  showView("detail");
+}
 
-  const isAuto = def.autoCreds === true;
-  // 已保存凭证但本次运行尚未连接：不能在这一态读取钥匙串，也不能诱导用户重录覆盖旧密钥
-  const lockedHasCreds = !isAuto && !def.unlocked && def.hasCreds === true;
-  el.detailFields.innerHTML = "";
+/// 详情页顶部的平台说明（自动凭证源额外渲染只读检测信息）
+function renderDetailHeader() {
+  const def = currentDef();
+  if (!def) return;
+  el.detailInfo.innerHTML = "";
 
-  if (isAuto) {
-    // 无用户可填字段：只展示后端现场检测到的登录态信息
+  if (def.autoCreds) {
     const info = def.autoInfo || {};
     el.detailDesc.textContent = `${def.subtitle} · 自动读取本机 Trae CN 登录态，无需填写凭证。`;
     const rows = [
@@ -649,78 +697,249 @@ function openDetail(id) {
       val.className = "ro";
       val.textContent = value;
       wrap.append(lb, val);
-      el.detailFields.appendChild(wrap);
+      el.detailInfo.appendChild(wrap);
     }
   } else {
-    if (lockedHasCreds) {
-      el.detailDesc.textContent = `${def.subtitle} · 该平台已保存凭证，但本次运行尚未连接。请先切到「${def.name}」的 tab 点击「连接账号」读取后再查看或修改。`;
-    } else {
-      el.detailDesc.textContent = `${def.subtitle} · 凭证只存本机，用于调用 ${def.name} 的接口。`;
-    }
-    for (const [i, f] of def.fields.entries()) {
-      const wrap = document.createElement("div");
-      wrap.className = "field";
+    el.detailDesc.textContent = `${def.subtitle} · 同一平台可保存多个账号，凭证只存本机。`;
+  }
+}
 
-      // 标题行：字段名 + （仅首个字段）指引链接，两者同一行不额外占纵向空间
-      const head = document.createElement("span");
-      head.className = "field-head";
-      const label = document.createElement("span");
-      label.className = "field-label";
-      label.textContent = f.label;
-      head.appendChild(label);
-      if (i === 0 && def.helpText) head.appendChild(helpLink(def));
-      wrap.appendChild(head);
+/// 渲染该平台已有的账号列表（含每行操作）
+function renderAccountList() {
+  const def = currentDef();
+  if (!def) return;
+  const accs = def.accounts || [];
 
-      const input = document.createElement("input");
-      input.type = f.secret ? "password" : "text";
-      input.value = f.value || "";
-      input.placeholder = f.placeholder || "";
-      input.spellcheck = false;
-      input.autocomplete = "off";
-      input.dataset.key = f.key;
+  el.accountList.innerHTML = "";
+  el.accountAdd.classList.toggle("hidden", def.autoCreds === true);
 
-      if (f.secret) {
-        const row = document.createElement("span");
-        row.className = "field-row";
-        const toggle = document.createElement("button");
-        toggle.type = "button";
-        toggle.className = "ghost-btn";
-        toggle.textContent = "显示";
-        toggle.addEventListener("click", () => {
-          const isPw = input.type === "password";
-          input.type = isPw ? "text" : "password";
-          toggle.textContent = isPw ? "隐藏" : "显示";
-        });
-        row.append(input, toggle);
-        wrap.appendChild(row);
-      } else {
-        wrap.appendChild(input);
-      }
-
-      el.detailFields.appendChild(wrap);
-    }
-
-    // 平台特定的授权提示（如阿里云建议用 RAM 子账号只读 AK）
-    if (def.note) {
-      const note = document.createElement("div");
-      note.className = "field-note";
-      note.textContent = def.note;
-      el.detailFields.appendChild(note);
-    }
+  if (def.autoCreds) {
+    // 自动凭证源只有一条固定条目，没有凭证字段，也不参与新增 / 删除
+    const a = accs[0];
+    const ok = !!a?.configured;
+    const row = document.createElement("div");
+    row.className = "account-row";
+    const main = document.createElement("div");
+    main.className = "account-row-main";
+    const name = document.createElement("span");
+    name.className = "account-row-name";
+    name.textContent = def.name;
+    const sub = document.createElement("span");
+    sub.className = "account-row-sub " + (ok ? "ok" : "warn");
+    sub.textContent = ok ? "自动读取本机登录态 · 可用" : "不可用";
+    main.append(name, sub);
+    row.appendChild(main);
+    el.accountList.appendChild(row);
+    return;
   }
 
-  el.detailInterval.value = String(def.interval || defaultInterval);
+  if (!accs.length) {
+    el.accountList.innerHTML = `<div class="empty">还没有账号，点下方「新增账号」录入密钥</div>`;
+    return;
+  }
+  for (const a of accs) el.accountList.appendChild(accountRow(a));
+}
+
+/// 单个账号一行：名称 + 状态 + （设为当前 / 编辑 / 删除）
+function accountRow(a) {
+  const row = document.createElement("div");
+  row.className = "account-row";
+
+  const main = document.createElement("div");
+  main.className = "account-row-main";
+  const name = document.createElement("span");
+  name.className = "account-row-name";
+  name.textContent = (a.label || "").trim() || "默认账号";
+  const sub = document.createElement("span");
+  sub.className = "account-row-sub";
+  if (a.ready) {
+    sub.textContent = "已连接 · 可用";
+    sub.classList.add("ok");
+  } else if (a.hasCreds) {
+    // 已保存但本次运行未连接：不能显示成「未配置」，否则会诱导用户重录
+    sub.textContent = "已保存 · 待连接";
+    sub.classList.add("warn");
+  } else {
+    sub.textContent = "未配置";
+  }
+  main.append(name, sub);
+  row.appendChild(main);
+
+  if (a.id === activeAccount) {
+    const cur = document.createElement("span");
+    cur.className = "account-cur";
+    cur.textContent = "当前";
+    row.appendChild(cur);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "account-actions";
+
+  if (a.id !== activeAccount) {
+    const useBtn = document.createElement("button");
+    useBtn.type = "button";
+    useBtn.className = "ghost-btn";
+    useBtn.textContent = "设为当前";
+    useBtn.addEventListener("click", () => makeCurrent(a.id));
+    actions.appendChild(useBtn);
+  }
+
+  const editBtn = document.createElement("button");
+  editBtn.type = "button";
+  editBtn.className = "ghost-btn";
+  editBtn.textContent = "编辑";
+  editBtn.addEventListener("click", () => openAccountForm(a.id));
+  actions.appendChild(editBtn);
+
+  const delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.className = "ghost-btn danger";
+  delBtn.textContent = "删除";
+  delBtn.addEventListener("click", () => removeAccount(a));
+  actions.appendChild(delBtn);
+
+  row.appendChild(actions);
+  return row;
+}
+
+/// 把某个账号设为当前展示的账号
+async function makeCurrent(accId) {
+  try {
+    await invoke("set_active_account", { accountId: accId });
+    activeAccount = accId;
+    await reloadCatalog();
+    renderAccountList();
+    setSettingsMsg("ok", "已设为当前账号");
+  } catch (e) {
+    setSettingsMsg("err", String(e));
+  }
+}
+
+/// 删除某个账号（含它在本机保存的凭证）
+async function removeAccount(a) {
+  const label = (a.label || "").trim() || "默认账号";
+  if (!window.confirm(`确定删除账号「${label}」？本机保存的密钥会一并清除。`)) return;
+  try {
+    const wasActive = a.id === activeAccount;
+    await invoke("delete_account", { accountId: a.id });
+    await reloadCatalog();
+    renderAccountList();
+    if (wasActive) await refresh(true);
+    setSettingsMsg("ok", "已删除该账号");
+  } catch (e) {
+    setSettingsMsg("err", String(e));
+  }
+}
+
+/// 底部按钮随「账号列表 / 账号表单」两种状态切换
+function syncFoot() {
+  const isAuto = currentDef()?.autoCreds === true;
+  const formOpen = !el.accountForm.classList.contains("hidden");
+  const editable = formOpen && !formLocked;
+
+  el.detailBack.classList.toggle("hidden", formOpen);
+  el.detailCancel.classList.toggle("hidden", !formOpen);
+  // 自动凭证源任何时候都能「重新检测」
+  el.detailTest.classList.toggle("hidden", isAuto ? false : !editable);
+  el.detailTest.textContent = isAuto ? "重新检测" : "测试连接";
+  el.detailSave.classList.toggle("hidden", !editable);
+  el.detailSave.textContent = editingAccountId ? "保存修改" : "保存并切换";
+}
+
+/// 收起账号表单，回到「账号列表」状态
+function closeAccountForm() {
+  editingAccountId = null;
+  formLocked = false;
+  el.accountForm.classList.add("hidden");
+  renderDetailHeader();
+  renderAccountList();
+  syncFoot();
+}
+
+/// 打开账号表单；accountId 为空表示「新增账号」
+function openAccountForm(accountId) {
+  const def = currentDef();
+  if (!def || def.autoCreds) return;
+  editingAccountId = accountId || null;
+  setSettingsMsg("", "");
+
+  const acc = editingAccountId ? (def.accounts || []).find((a) => a.id === editingAccountId) : null;
+  // 已保存凭证但本次运行尚未连接：不能在这一态读钥匙串，也不能诱导用户重录覆盖旧密钥
+  formLocked = !!acc && acc.unlocked === false && acc.hasCreds === true;
+
+  const accName = (acc?.label || "").trim() || "默认账号";
+  el.detailDesc.textContent = acc
+    ? `${def.subtitle} · 正在编辑「${accName}」的凭证。`
+    : `${def.subtitle} · 新增一个「${def.name}」账号，凭证只存本机。`;
+
+  el.detailLabel.value = acc?.label || "";
+
+  // 编辑已有账号用该账号回填的值；新增用平台 schema（值均为空）
+  const fields = (acc ? acc.fields : def.fields) || [];
+  el.detailFields.innerHTML = "";
+  for (const [i, f] of fields.entries()) {
+    const wrap = document.createElement("div");
+    wrap.className = "field";
+
+    // 标题行：字段名 + （仅首个字段）指引链接，两者同一行不额外占纵向空间
+    const head = document.createElement("span");
+    head.className = "field-head";
+    const label = document.createElement("span");
+    label.className = "field-label";
+    label.textContent = f.label;
+    head.appendChild(label);
+    if (i === 0 && def.helpText) head.appendChild(helpLink(def));
+    wrap.appendChild(head);
+
+    const input = document.createElement("input");
+    input.type = f.secret ? "password" : "text";
+    input.value = f.value || "";
+    input.placeholder = f.placeholder || "";
+    input.spellcheck = false;
+    input.autocomplete = "off";
+    input.dataset.key = f.key;
+
+    if (f.secret) {
+      const row = document.createElement("span");
+      row.className = "field-row";
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "ghost-btn";
+      toggle.textContent = "显示";
+      toggle.addEventListener("click", () => {
+        const isPw = input.type === "password";
+        input.type = isPw ? "text" : "password";
+        toggle.textContent = isPw ? "隐藏" : "显示";
+      });
+      row.append(input, toggle);
+      wrap.appendChild(row);
+    } else {
+      wrap.appendChild(input);
+    }
+
+    el.detailFields.appendChild(wrap);
+  }
+
+  // 平台特定的授权提示（如阿里云建议用 RAM 子账号只读 AK）
+  if (def.note) {
+    const note = document.createElement("div");
+    note.className = "field-note";
+    note.textContent = def.note;
+    el.detailFields.appendChild(note);
+  }
+
+  el.detailInterval.value = String(acc?.interval || defaultInterval);
   el.detailInterval.min = String(minInterval);
   el.detailInterval.max = String(maxInterval);
 
-  // 自动凭证的源没有表单：隐藏保存 / 清除，把「测试连接」改成「重新检测」
-  // 锁定态且已保存凭证时：隐藏保存 / 测试，避免用空表单覆盖钥匙串里的旧密钥
-  el.detailSave.classList.toggle("hidden", isAuto || lockedHasCreds);
-  el.detailClear.classList.toggle("hidden", isAuto || !def.configured);
-  el.detailTest.classList.toggle("hidden", lockedHasCreds);
-  el.detailTest.textContent = isAuto ? "重新检测" : "测试连接";
-
-  showView("detail");
+  el.accountForm.classList.remove("hidden");
+  if (formLocked) {
+    setSettingsMsg(
+      "warn",
+      "该账号已保存凭证，但本次运行尚未连接。请先切到它的 tab 点「连接账号」读取后再修改，避免覆盖已有密钥。"
+    );
+  }
+  syncFoot();
   el.detailFields.querySelector("input")?.focus();
 }
 
@@ -740,20 +959,23 @@ function readDetailValues() {
 }
 
 async function saveDetail() {
-  if (!currentSource) return;
-  const id = currentSource.id;
+  const def = currentDef();
+  if (!def) return;
   el.detailSave.disabled = true;
   el.detailSave.textContent = "保存中…";
   try {
-    await invoke("save_source_credentials", {
-      sourceId: id,
+    const accId = await invoke("save_account_credentials", {
+      sourceId: def.id,
+      accountId: editingAccountId,
+      label: el.detailLabel.value.trim(),
       values: readDetailValues(),
     });
     await invoke("set_refresh_interval", {
-      sourceId: id,
+      accountId: accId,
       seconds: readIntervalValue(),
     });
-    // 保存后后端会把该平台设为当前场景，重新拉清单让 Tab / 间隔都跟上
+    // 保存后后端会把该账号设为当前，重新拉清单让 Tab / 间隔都跟上
+    activeAccount = accId;
     await reloadCatalog();
     await refresh(true);
     closeSettings();
@@ -761,26 +983,27 @@ async function saveDetail() {
     setSettingsMsg("err", String(e));
   } finally {
     el.detailSave.disabled = false;
-    el.detailSave.textContent = "保存并切换";
+    syncFoot();
   }
 }
 
 async function testDetail() {
-  if (!currentSource) return;
+  const def = currentDef();
+  if (!def) return;
 
   // 自动凭证的源：重新检测 = 重新拉清单（后端现场重读登录态文件）
-  if (currentSource.autoCreds) {
+  if (def.autoCreds) {
     el.detailTest.disabled = true;
     el.detailTest.textContent = "检测中…";
     try {
       await reloadCatalog();
-      openDetail(currentSource.id);
+      openDetail(def.id);
       setSettingsMsg("ok", "已重新检测本机登录态");
     } catch (e) {
       setSettingsMsg("err", String(e));
     } finally {
       el.detailTest.disabled = false;
-      el.detailTest.textContent = "重新检测";
+      syncFoot();
     }
     return;
   }
@@ -789,12 +1012,12 @@ async function testDetail() {
   el.detailTest.textContent = "测试中…";
   try {
     const r = await invoke("test_source", {
-      sourceId: currentSource.id,
+      sourceId: def.id,
       values: readDetailValues(),
     });
     let text = "连接成功";
     try {
-      const view = (window.AFP_SOURCES || {})[currentSource.id]?.render(r?.data);
+      const view = (window.AFP_SOURCES || {})[def.id]?.render(r?.data);
       if (view?.summary) text = `连接成功 · ${view.summary}`;
     } catch (_) {
       /* 展示解析失败不影响「已连通」这个结论 */
@@ -804,20 +1027,7 @@ async function testDetail() {
     setSettingsMsg("err", String(e));
   } finally {
     el.detailTest.disabled = false;
-    el.detailTest.textContent = "测试连接";
-  }
-}
-
-async function clearDetail() {
-  if (!currentSource) return;
-  const id = currentSource.id;
-  try {
-    await invoke("clear_source_credentials", { sourceId: id });
-    await reloadCatalog();
-    openDetail(id);
-    setSettingsMsg("ok", "已清除本机的该平台凭证");
-  } catch (e) {
-    setSettingsMsg("err", String(e));
+    syncFoot();
   }
 }
 
@@ -826,18 +1036,24 @@ el.settingsClose.addEventListener("click", closeSettings);
 el.settingsBackdrop.addEventListener("click", closeSettings);
 el.detailBack.addEventListener("click", () => {
   setSettingsMsg("", "");
+  closeAccountForm();
   showView("list");
 });
+el.detailCancel.addEventListener("click", () => {
+  setSettingsMsg("", "");
+  closeAccountForm();
+});
+el.accountAdd.addEventListener("click", () => openAccountForm(null));
 el.detailSave.addEventListener("click", saveDetail);
 el.detailTest.addEventListener("click", testDetail);
-el.detailClear.addEventListener("click", clearDetail);
 
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape" || !settingsOpen()) return;
-  // 详情页先退回列表，再按一次才关闭弹窗
+  // 详情页先退回列表，再按一次才关闭弹窗；表单打开时先收起表单
   if (!el.detailView.classList.contains("hidden")) {
     setSettingsMsg("", "");
-    showView("list");
+    if (!el.accountForm.classList.contains("hidden")) closeAccountForm();
+    else showView("list");
     return;
   }
   closeSettings();
@@ -942,7 +1158,7 @@ el.floatCard.addEventListener("click", (e) => {
     floatDown && Math.hypot(e.screenX - floatDown.x, e.screenY - floatDown.y) > 6;
   floatDown = null;
   if (moved) return;
-  if (lockedScene) connectSource(activeSource);
+  if (lockedScene) connectAccount(activeAccount);
   else refresh(true);
 });
 
@@ -1044,10 +1260,10 @@ async function bootstrap() {
   // 先拉清单（不触碰钥匙串）：让 tab / 列表 / 待连接卡片都能拿到平台名，再取数
   try {
     await reloadCatalog();
-    const cur = catalog.find((s) => s.id === activeSource);
-    // 已保存凭证但本次尚未连接的钥匙串源不弹设置（主界面已给「连接账号」入口）；
+    const cur = entryById(activeAccount);
+    // 已保存凭证但本次尚未连接的钥匙串账号不弹设置（主界面已给「连接账号」入口）；
     // trae 不可用 / 确实未配置仍按原逻辑引导去设置页录入。
-    if (!cur?.configured) openSettings();
+    if (!cur?.account.configured) openSettings();
   } catch (_) {
     /* 忽略：清单读取失败不影响主流程 */
   }

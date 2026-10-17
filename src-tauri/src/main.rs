@@ -474,10 +474,10 @@ fn trae_payload(raw: serde_json::Value, probe: &TraeProbe) -> serde_json::Value 
 /// 保证老用户升级后已存的凭证不丢（对应待办 M-09）。
 fn read_store(app: &tauri::AppHandle) -> serde_json::Value {
     let Ok(path) = credentials_path(app) else {
-        return serde_json::json!({ "version": 2, "sources": {} });
+        return serde_json::json!({ "version": 3, "sources": {} });
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return serde_json::json!({ "version": 2, "sources": {} });
+        return serde_json::json!({ "version": 3, "sources": {} });
     };
     let mut store: serde_json::Value =
         serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
@@ -570,33 +570,114 @@ fn write_settings(app: &tauri::AppHandle, store: &serde_json::Value) -> Result<(
 
 /* ---------- 凭证读写：系统钥匙串优先（E-01），不可用时退回凭证文件 ---------- */
 
-/// 钥匙串里的服务名；账号用数据源 id（如 volcengine），每条密码存该平台凭证的 JSON
+/// 钥匙串里的服务名；账号键 = 账号 id 加 `a:` 前缀（如 a:aliyun:1），每条密码存该账号凭证的
+/// JSON。加前缀是为了与 v0.2.x 的旧条目（account = 数据源 id，如 aliyun）隔离、不碰撞。
 const KEYRING_SERVICE: &str = "com.tangsanlang.floating";
 
-/// 改 identifier 之前用过的钥匙串服务名，解锁时把条目一次性搬到新服务名下
+/// 改 identifier 之前用过的钥匙串服务名；账号迁移时会把其中的旧条目一并搬走
 const LEGACY_KEYRING_SERVICE: &str = "com.usheai.afpusage";
 
-/* ---------- 会话级解锁闸门（按数据源懒加载） ---------- */
+/// 钥匙串条目里用的账号键：加前缀与旧条目（account = sourceId）隔离
+fn account_key(account_id: &str) -> String {
+    format!("a:{}", account_id)
+}
 
-/// 本次运行内已解锁（可读钥匙串）的数据源 id 列表。默认空，**不写盘**。
+/* ---------- 账号：把「账号」提升为一等公民（v0.3.0 多账号支持） ---------- */
+
+/// 一个已保存账号的元信息（**不含任何密钥值**，可安全落在凭证文件里）
+#[derive(Clone)]
+struct AccountMeta {
+    id: String,
+    source_id: String,
+    label: String,
+}
+
+/// 读取全部账号元信息（按保存顺序，决定 Tab 顺序）
+fn read_accounts(app: &tauri::AppHandle) -> Vec<AccountMeta> {
+    read_store(app)
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let o = v.as_object()?;
+                    let id = o.get("id")?.as_str()?.trim().to_string();
+                    let source_id = o.get("sourceId")?.as_str()?.trim().to_string();
+                    if id.is_empty() || source_id.is_empty() {
+                        return None;
+                    }
+                    let label = o
+                        .get("label")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(AccountMeta { id, source_id, label })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 整体重写账号元信息列表（只含 id / sourceId / label，不含密钥）
+fn write_accounts(app: &tauri::AppHandle, accounts: &[AccountMeta]) -> Result<(), String> {
+    let mut store = read_store(app);
+    store["version"] = serde_json::json!(3);
+    store["accounts"] = serde_json::json!(accounts
+        .iter()
+        .map(|a| serde_json::json!({ "id": a.id, "sourceId": a.source_id, "label": a.label }))
+        .collect::<Vec<_>>());
+    write_store(app, &store)
+}
+
+/// 生成一个该平台下尚未使用过的账号 id（形如 `aliyun:1`）
+fn gen_account_id(source_id: &str, existing: &[AccountMeta]) -> String {
+    let mut n = 1;
+    loop {
+        let cand = format!("{}:{}", source_id, n);
+        if !existing.iter().any(|a| a.id == cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// 解析账号 id →（数据源定义, 账号名）。
+/// trae 这类自动凭证源没有账号概念，它的「账号 id」就是数据源 id。
+fn resolve_account(
+    app: &tauri::AppHandle,
+    account_id: &str,
+) -> Option<(&'static SourceDef, String)> {
+    if let Some(def) = source_def(account_id) {
+        if def.auto_creds {
+            return Some((def, String::new()));
+        }
+    }
+    let acc = read_accounts(app).into_iter().find(|a| a.id == account_id)?;
+    let def = source_def(&acc.source_id)?;
+    Some((def, acc.label))
+}
+
+/* ---------- 会话级解锁闸门（按账号懒加载） ---------- */
+
+/// 本次运行内已解锁（可读钥匙串）的**账号 id** 列表。默认空，**不写盘**。
 ///
 /// 启动阶段列表为空，因此所有读钥匙串的函数都直接返回空、绝不调用 keyring，不会弹授权框；
-/// 用户**第一次**切到需要凭证的 tab（或点「连接账号」）时，`unlock_all_sources` 会把**全部**
-/// 有凭证的数据源一次性读进内存并加入这里，此后切换任何 tab 都命中已解锁状态、不再重复弹框。
-/// 解锁与否只对本次运行有效，下次启动仍是「首次触发才读」。
-static UNLOCKED_SOURCES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// 用户**第一次**点「连接账号」（或切到某个需要凭证的账号）时，`unlock_all_accounts` 会把
+/// **全部**已保存账号一次性读进内存并加入这里，此后切换任何账号都命中已解锁状态、不再重复
+/// 弹框。解锁与否只对本次运行有效，下次启动仍是「首次触发才读」。
+static UNLOCKED_ACCOUNTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// 该数据源本次运行是否已解锁（可读钥匙串）
-fn source_unlocked(id: &str) -> bool {
-    UNLOCKED_SOURCES
+/// 该账号本次运行是否已解锁（可读钥匙串）
+fn account_unlocked(id: &str) -> bool {
+    UNLOCKED_ACCOUNTS
         .lock()
         .map(|v| v.iter().any(|x| x == id))
         .unwrap_or(false)
 }
 
-/// 置位 / 清除某数据源的会话解锁状态（仅本次运行有效）
-fn set_source_unlocked(id: &str, on: bool) {
-    if let Ok(mut v) = UNLOCKED_SOURCES.lock() {
+/// 置位 / 清除某账号的会话解锁状态（仅本次运行有效）
+fn set_account_unlocked(id: &str, on: bool) {
+    if let Ok(mut v) = UNLOCKED_ACCOUNTS.lock() {
         let present = v.iter().any(|x| x == id);
         if on && !present {
             v.push(id.to_string());
@@ -606,9 +687,9 @@ fn set_source_unlocked(id: &str, on: bool) {
     }
 }
 
-/// 本次运行是否有任意数据源已解锁（用于判断钥匙串存储方式是否需真实探测）
-fn any_source_unlocked() -> bool {
-    UNLOCKED_SOURCES
+/// 本次运行是否有任意账号已解锁（用于判断钥匙串存储方式是否需真实探测）
+fn any_account_unlocked() -> bool {
+    UNLOCKED_ACCOUNTS
         .lock()
         .map(|v| !v.is_empty())
         .unwrap_or(false)
@@ -628,17 +709,15 @@ fn keychain_ready() -> bool {
     ready
 }
 
-fn keychain_entry(id: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYRING_SERVICE, id).map_err(|e| format!("打开系统钥匙串失败: {}", e))
+fn keychain_entry(account_id: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, &account_key(account_id))
+        .map_err(|e| format!("打开系统钥匙串失败: {}", e))
 }
 
-/// 读钥匙串里某个平台的凭证；没有条目或钥匙串不可用时返回 None。
-/// 该源未解锁时直接返回 None，绝不调用 keyring（避免启动 / 未连接时弹出授权框）。
-fn read_keychain_creds(id: &str) -> Option<HashMap<String, String>> {
-    if !source_unlocked(id) {
-        return None;
-    }
-    let entry = keychain_entry(id).ok()?;
+/// 读钥匙串里某个账号的凭证；没有条目或钥匙串不可用时返回 None。
+/// 是否允许访问钥匙串由调用方（read_account_creds）按会话解锁态把关。
+fn read_keychain_creds(account_id: &str) -> Option<HashMap<String, String>> {
+    let entry = keychain_entry(account_id).ok()?;
     let secret = entry.get_password().ok()?;
     let map: HashMap<String, String> = serde_json::from_str(&secret).ok()?;
     Some(clean_creds(map))
@@ -657,13 +736,14 @@ fn clean_creds(map: HashMap<String, String>) -> HashMap<String, String> {
         .collect()
 }
 
-/// 读凭证文件里该平台的明文凭证（历史数据，或钥匙串不可用时的兜底）
-fn read_plaintext_creds(app: &tauri::AppHandle, id: &str) -> HashMap<String, String> {
+/// 读凭证文件里某账号的明文凭证（历史数据，或钥匙串不可用时的兜底）。
+/// 明文文件里 `sources` 以「账号 id」为键；老格式（键为数据源 id）由迁移单独处理。
+fn read_plaintext_creds(app: &tauri::AppHandle, account_id: &str) -> HashMap<String, String> {
     let store = read_store(app);
     let mut out = HashMap::new();
     if let Some(obj) = store
         .get("sources")
-        .and_then(|s| s.get(id))
+        .and_then(|s| s.get(account_id))
         .and_then(|v| v.as_object())
     {
         for (k, val) in obj {
@@ -678,22 +758,22 @@ fn read_plaintext_creds(app: &tauri::AppHandle, id: &str) -> HashMap<String, Str
 /// 写入明文凭证到凭证文件（仅钥匙串不可用时使用）
 fn write_plaintext_creds(
     app: &tauri::AppHandle,
-    id: &str,
+    account_id: &str,
     creds: &HashMap<String, String>,
 ) -> Result<(), String> {
     let mut store = read_store(app);
-    store["version"] = serde_json::json!(2);
-    store["sources"][id] = serde_json::to_value(creds).map_err(|e| e.to_string())?;
+    store["version"] = serde_json::json!(3);
+    store["sources"][account_id] = serde_json::to_value(creds).map_err(|e| e.to_string())?;
     write_store(app, &store)
 }
 
-/// 从凭证文件里抹掉某个平台的明文凭证
-fn remove_plaintext_creds(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+/// 从凭证文件里抹掉某个账号的明文凭证
+fn remove_plaintext_creds(app: &tauri::AppHandle, account_id: &str) -> Result<(), String> {
     let mut store = read_store(app);
     let removed = store
         .get_mut("sources")
         .and_then(|s| s.as_object_mut())
-        .map(|sources| sources.remove(id).is_some())
+        .map(|sources| sources.remove(account_id).is_some())
         .unwrap_or(false);
     if !removed {
         return Ok(());
@@ -701,11 +781,12 @@ fn remove_plaintext_creds(app: &tauri::AppHandle, id: &str) -> Result<(), String
     write_store(app, &store)
 }
 
-/* ---------- 明文标记：哪些平台已保存过凭证（不含任何密钥值） ---------- */
+/* ---------- 明文标记：哪些账号已保存过凭证（不含任何密钥值） ---------- */
 
-/// 读取「已保存凭证的平台 id 列表」标记（存于凭证文件，仅 id、不含密钥）。
-/// 用于在锁定态不读钥匙串时也能判断某平台「是否已保存凭证」。
-fn saved_platform_ids(app: &tauri::AppHandle) -> Vec<String> {
+/// 读取「已保存凭证的 id 列表」标记（存于凭证文件，仅 id、不含密钥）。
+/// v0.3.0 起存的是**账号 id**；v0.2.x 存的是数据源 id，迁移期按平台兜底识别。
+/// 用于在锁定态不读钥匙串时也能判断某账号「是否已保存凭证」。
+fn saved_account_ids(app: &tauri::AppHandle) -> Vec<String> {
     read_store(app)
         .get("savedIds")
         .and_then(|v| v.as_array())
@@ -717,16 +798,16 @@ fn saved_platform_ids(app: &tauri::AppHandle) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 整体重写「已保存凭证的平台 id」标记列表
+/// 整体重写「已保存凭证的 id」标记列表
 fn write_saved_ids(app: &tauri::AppHandle, ids: &[String]) -> Result<(), String> {
     let mut store = read_store(app);
     store["savedIds"] = serde_json::json!(ids);
     write_store(app, &store)
 }
 
-/// 增 / 删单个平台 id（幂等；只是标记，不含任何凭证值）
+/// 增 / 删单个 id（幂等；只是标记，不含任何凭证值）
 fn mark_saved(app: &tauri::AppHandle, id: &str, saved: bool) -> Result<(), String> {
-    let mut ids = saved_platform_ids(app);
+    let mut ids = saved_account_ids(app);
     let present = ids.iter().any(|x| x == id);
     if saved && !present {
         ids.push(id.to_string());
@@ -738,9 +819,19 @@ fn mark_saved(app: &tauri::AppHandle, id: &str, saved: bool) -> Result<(), Strin
     write_saved_ids(app, &ids)
 }
 
-/// 该平台是否已保存过凭证：标记里有该 id，或凭证文件里仍有该平台明文
-fn has_saved_creds(app: &tauri::AppHandle, id: &str) -> bool {
-    saved_platform_ids(app).iter().any(|x| x == id) || !read_plaintext_creds(app, id).is_empty()
+/// 该账号是否已保存过凭证：标记里有它的账号 id、或标记里仍有它所属平台 id
+/// （v0.2.x 老标记），或凭证文件里还有它的明文。
+fn has_saved_creds(app: &tauri::AppHandle, account_id: &str) -> bool {
+    let ids = saved_account_ids(app);
+    if ids.iter().any(|x| x == account_id) {
+        return true;
+    }
+    if let Some(acc) = read_accounts(app).into_iter().find(|a| a.id == account_id) {
+        if ids.iter().any(|x| x == &acc.source_id) {
+            return true;
+        }
+    }
+    !read_plaintext_creds(app, account_id).is_empty()
 }
 
 /* ---------- 一次性迁移标记（避免每次解锁重跑） ---------- */
@@ -764,44 +855,44 @@ fn mark_migration_done(app: &tauri::AppHandle, key: &str) {
     let _ = write_store(app, &store);
 }
 
-/// 读某平台凭证：钥匙串优先，取不到再退回凭证文件。
-/// 该源未解锁时直接返回空，钥匙串与明文都不读（「先连接再加载」）。
-fn read_source_creds(app: &tauri::AppHandle, id: &str) -> HashMap<String, String> {
-    if !source_unlocked(id) {
+/// 读某账号凭证：钥匙串优先，取不到再退回凭证文件。
+/// 该账号未解锁时直接返回空，钥匙串与明文都不读（「先连接再加载」）。
+fn read_account_creds(app: &tauri::AppHandle, account_id: &str) -> HashMap<String, String> {
+    if !account_unlocked(account_id) {
         return HashMap::new();
     }
     if keychain_ready() {
-        if let Some(creds) = read_keychain_creds(id) {
+        if let Some(creds) = read_keychain_creds(account_id) {
             return creds;
         }
     }
-    read_plaintext_creds(app, id)
+    read_plaintext_creds(app, account_id)
 }
 
-/// 写某平台凭证：钥匙串可用则写钥匙串，并抹掉文件里的同一份明文
-fn write_source_creds(
+/// 写某账号凭证：钥匙串可用则写钥匙串，并抹掉文件里的同一份明文
+fn write_account_creds(
     app: &tauri::AppHandle,
-    id: &str,
+    account_id: &str,
     creds: &HashMap<String, String>,
 ) -> Result<(), String> {
     if keychain_ready() {
-        let entry = keychain_entry(id)?;
+        let entry = keychain_entry(account_id)?;
         let blob = serde_json::to_string(creds).map_err(|e| e.to_string())?;
         entry
             .set_password(&blob)
             .map_err(|e| format!("写入系统钥匙串失败: {}", e))?;
         // 同一份密钥不留两处：钥匙串写成功即清掉文件里的明文
-        let _ = remove_plaintext_creds(app, id);
+        let _ = remove_plaintext_creds(app, account_id);
         return Ok(());
     }
-    write_plaintext_creds(app, id, creds)
+    write_plaintext_creds(app, account_id, creds)
 }
 
-/// 删除某平台凭证：钥匙串条目与文件明文都清掉
-fn delete_source_creds(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+/// 删除某账号凭证：钥匙串条目与文件明文都清掉
+fn delete_account_creds(app: &tauri::AppHandle, account_id: &str) -> Result<(), String> {
     let mut failure: Option<String> = None;
     if keychain_ready() {
-        if let Ok(entry) = keychain_entry(id) {
+        if let Ok(entry) = keychain_entry(account_id) {
             match entry.delete_credential() {
                 // 本来就没有这条，也算清干净了
                 Ok(()) | Err(keyring::Error::NoEntry) => {}
@@ -809,55 +900,186 @@ fn delete_source_creds(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
             }
         }
     }
-    let _ = remove_plaintext_creds(app, id);
+    let _ = remove_plaintext_creds(app, account_id);
     match failure {
         Some(e) => Err(e),
         None => Ok(()),
     }
 }
 
-/// 一次性迁移：把凭证文件里某平台的历史明文搬进系统钥匙串，成功后抹掉文件里的那份。
-/// **只在解锁该源时调用**（启动不执行），且只处理这一个平台，不触碰其他平台的钥匙串。
-///
-/// 钥匙串里已有该平台条目时跳过（避免用旧明文覆盖），那份明文会留到用户下次
-/// 保存凭证时才清掉 —— 宁可多留一份，也不冒丢掉密钥的风险。
-fn migrate_source_to_keychain(app: &tauri::AppHandle, id: &str) {
-    let key = format!("plaintext:{}", id);
-    if migration_done(app, &key) || !keychain_ready() {
-        return;
+/* ---------- 老数据迁移：v0.2.x 的「按平台存」搬到 v0.3.0 的「按账号存」 ---------- */
+
+/// 读老格式的明文凭证：v0.2.x 把某平台凭证平铺在 `sources[sourceId]`。
+/// 新格式的键一定带 `:`（账号 id 形如 aliyun:1），所以只有不像账号 id 时才当老数据读。
+fn read_legacy_plaintext(app: &tauri::AppHandle, source_id: &str) -> HashMap<String, String> {
+    if source_id.contains(':') {
+        return HashMap::new();
     }
-    let creds = clean_creds(read_plaintext_creds(app, id));
-    if !creds.is_empty() && read_keychain_creds(id).is_none() {
-        if let Ok(entry) = keychain_entry(id) {
-            if let Ok(blob) = serde_json::to_string(&creds) {
-                if entry.set_password(&blob).is_ok() {
-                    let _ = remove_plaintext_creds(app, id);
-                }
-            }
-        }
-    }
-    mark_migration_done(app, &key);
+    read_plaintext_creds(app, source_id)
 }
 
-/// 一次性迁移：把旧服务名（改 identifier 前）下某平台的钥匙串条目搬到新服务名下。
-/// **只在解锁该源时调用**（启动不执行），且只处理这一个平台，不触碰其他平台的钥匙串。
-///
-/// 新服务名下已有同平台条目时跳过（不覆盖），旧条目读完确认新条目写成功后才删。
-fn migrate_legacy_service_for(app: &tauri::AppHandle, id: &str) {
-    let key = format!("legacyService:{}", id);
-    if migration_done(app, &key) || !keychain_ready() {
-        return;
-    }
-    if let Ok(old) = keyring::Entry::new(LEGACY_KEYRING_SERVICE, id) {
-        if let Ok(secret) = old.get_password() {
-            if let Ok(new) = keychain_entry(id) {
-                if new.get_password().is_err() && new.set_password(&secret).is_ok() {
-                    let _ = old.delete_credential();
+/// 读老格式的凭证：现服务名（account = sourceId）→ 旧服务名 → 明文文件。
+/// **只在解锁流程里调用**（启动阶段不碰钥匙串）。
+fn read_legacy_source_creds(app: &tauri::AppHandle, source_id: &str) -> HashMap<String, String> {
+    if keychain_ready() {
+        for svc in [KEYRING_SERVICE, LEGACY_KEYRING_SERVICE] {
+            if let Ok(entry) = keyring::Entry::new(svc, source_id) {
+                if let Ok(secret) = entry.get_password() {
+                    if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&secret) {
+                        let creds = clean_creds(map);
+                        if !creds.is_empty() {
+                            return creds;
+                        }
+                    }
                 }
             }
         }
     }
-    mark_migration_done(app, &key);
+    read_legacy_plaintext(app, source_id)
+}
+
+/// 清掉某平台的老位置凭证（旧服务名 + 现服务名下 account = sourceId 的条目 + 明文平铺项）。
+/// 新位置写成功后才调用 —— 宁可多留一份，也不冒丢密钥的风险。
+fn delete_legacy_source_creds(app: &tauri::AppHandle, source_id: &str) {
+    if keychain_ready() {
+        for svc in [KEYRING_SERVICE, LEGACY_KEYRING_SERVICE] {
+            if let Ok(entry) = keyring::Entry::new(svc, source_id) {
+                let _ = entry.delete_credential();
+            }
+        }
+    }
+    let mut store = read_store(app);
+    let mut changed = false;
+    if let Some(obj) = store.get_mut("sources").and_then(|s| s.as_object_mut()) {
+        changed = obj.remove(source_id).is_some();
+    }
+    if changed {
+        let _ = write_store(app, &store);
+    }
+}
+
+/// 启动阶段（未解锁、**不碰钥匙串**）为老用户补登账号元信息：
+/// v0.2.x 的凭证按「数据源 id」保存，`savedIds` 里存的是平台 id。这里为每个
+/// 「标记里有、但还没有任何账号」的平台预建一个「默认账号」，并记下
+/// 旧 sourceId → 新 accountId 的映射，等解锁时再把凭证搬进来。
+/// 这样老用户升级后在锁定态也能正常看到 Tab 与「已保存 · 待连接」。
+fn ensure_legacy_account_meta(app: &tauri::AppHandle) {
+    if !read_accounts(app).is_empty() {
+        return;
+    }
+    let legacy_ids = saved_account_ids(app);
+    let mut accounts: Vec<AccountMeta> = Vec::new();
+    let mut map = serde_json::Map::new();
+    for def in SOURCES.iter().filter(|d| !d.auto_creds) {
+        if !legacy_ids.iter().any(|x| x == def.id) {
+            continue;
+        }
+        let id = gen_account_id(def.id, &accounts);
+        map.insert(def.id.to_string(), serde_json::json!(id));
+        accounts.push(AccountMeta {
+            id,
+            source_id: def.id.to_string(),
+            label: "默认账号".to_string(),
+        });
+    }
+    if accounts.is_empty() {
+        return;
+    }
+    let mut store = read_store(app);
+    store["version"] = serde_json::json!(3);
+    store["accounts"] = serde_json::json!(accounts
+        .iter()
+        .map(|a| serde_json::json!({ "id": a.id, "sourceId": a.source_id, "label": a.label }))
+        .collect::<Vec<_>>());
+    store["legacyAccountMap"] = serde_json::Value::Object(map);
+    let _ = write_store(app, &store);
+}
+
+/// 一次性把老凭证搬进账号模型：**只在第一次解锁时执行**（此时才能读钥匙串）。
+/// 每个平台最多搬一次；已有凭证的账号不覆盖，绝不丢密钥。
+fn migrate_accounts_v3(app: &tauri::AppHandle) {
+    if migration_done(app, "accounts:v3") {
+        return;
+    }
+    let legacy_map = read_store(app)
+        .get("legacyAccountMap")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut accounts = read_accounts(app);
+
+    for def in SOURCES.iter().filter(|d| !d.auto_creds) {
+        // 迁移目标账号：优先启动阶段预登记的那个「默认账号」，其次该平台已有的第一个账号
+        let target = legacy_map
+            .get(def.id)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|id| accounts.iter().any(|a| &a.id == id))
+            .or_else(|| {
+                accounts
+                    .iter()
+                    .find(|a| a.source_id == def.id)
+                    .map(|a| a.id.clone())
+            });
+        // 先解锁再检查，避免把「钥匙串里已有凭证」的账号误判成空而重复覆盖
+        if let Some(id) = &target {
+            set_account_unlocked(id, true);
+            if !read_account_creds(app, id).is_empty() {
+                continue;
+            }
+        }
+
+        let legacy = read_legacy_source_creds(app, def.id);
+        if legacy.is_empty() {
+            continue;
+        }
+        // 目标账号存在就复用它，否则新建一个
+        let acc_id = match target {
+            Some(id) => id,
+            None => {
+                let id = gen_account_id(def.id, &accounts);
+                accounts.push(AccountMeta {
+                    id: id.clone(),
+                    source_id: def.id.to_string(),
+                    label: "默认账号".to_string(),
+                });
+                id
+            }
+        };
+        if write_account_creds(app, &acc_id, &legacy).is_ok() {
+            delete_legacy_source_creds(app, def.id);
+            set_account_unlocked(&acc_id, true);
+            let _ = mark_saved(app, &acc_id, true);
+        }
+    }
+
+    write_accounts(app, &accounts).ok();
+
+    // 旧的 active 是「数据源 id」时，改写为对应的账号 id
+    let mut store = read_store(app);
+    let cur = store
+        .get("active")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if source_def(&cur).map(|d| !d.auto_creds).unwrap_or(false) {
+        let mapped = legacy_map
+            .get(&cur)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                accounts
+                    .iter()
+                    .find(|a| a.source_id == cur)
+                    .map(|a| a.id.clone())
+            });
+        if let Some(id) = mapped {
+            if accounts.iter().any(|a| a.id == id) {
+                store["active"] = serde_json::json!(id);
+            }
+        }
+    }
+    let _ = write_store(app, &store);
+    mark_migration_done(app, "accounts:v3");
 }
 
 /// 该数据源的必需字段是否都填了
@@ -865,16 +1087,17 @@ fn creds_complete(def: &SourceDef, creds: &HashMap<String, String>) -> bool {
     def.fields.iter().all(|f| creds.contains_key(f.key))
 }
 
-/// 取当前生效的凭证：应用内设置优先，火山方舟再兜底 .env / 环境变量。
-/// 该源未解锁时直接返回 None —— 既不读钥匙串，也跳过 .env 兜底（否则方舟会在未连接时照常出数）。
+/// 取某账号当前生效的凭证：应用内设置优先，火山方舟再兜底 .env / 环境变量。
+/// 该账号未解锁时直接返回 None —— 既不读钥匙串，也跳过 .env 兜底（否则方舟会在未连接时照常出数）。
 fn effective_creds(
     app: &tauri::AppHandle,
+    account_id: &str,
     def: &SourceDef,
 ) -> Option<(HashMap<String, String>, &'static str)> {
-    if !source_unlocked(def.id) {
+    if !account_unlocked(account_id) {
         return None;
     }
-    let saved = read_source_creds(app, def.id);
+    let saved = read_account_creds(app, account_id);
     if creds_complete(def, &saved) {
         return Some((saved, "settings"));
     }
@@ -889,14 +1112,27 @@ fn effective_creds(
     None
 }
 
-/// 读取当前场景 id（未设置时取注册表第一个）
-fn active_source_id(app: &tauri::AppHandle) -> String {
-    read_store(app)
+/// 读取当前账号 id：存的 id 失效时退回第一个账号；一个账号都没有时退回第一个数据源（trae）
+fn active_account_id(app: &tauri::AppHandle) -> String {
+    let accounts = read_accounts(app);
+    let stored = read_store(app)
         .get("active")
         .and_then(|v| v.as_str())
-        .filter(|s| source_def(s).is_some())
-        .unwrap_or(SOURCES[0].id)
-        .to_string()
+        .unwrap_or("")
+        .to_string();
+    if accounts.iter().any(|a| a.id == stored) {
+        return stored;
+    }
+    // trae 这类自动凭证源没有账号，其 id 可被直接当作「当前」
+    if let Some(def) = source_def(&stored) {
+        if def.auto_creds {
+            return stored;
+        }
+    }
+    if let Some(a) = accounts.first() {
+        return a.id.clone();
+    }
+    SOURCES[0].id.to_string()
 }
 
 /// 兜底来源：环境变量 / .env（仅方便本地开发，不参与打包发布）
@@ -1577,72 +1813,33 @@ async fn fetch_aliyun_overview(
     }))
 }
 
-/// 平台清单：供设置弹窗渲染「平台列表 + 各平台字段」，并回填已保存的值。
-/// **不触碰钥匙串**：已保存与否只看明文标记，凭证值仅在该源解锁后才回填。
+/// 平台清单：供设置弹窗渲染「平台 + 各平台账号」，并回填已保存的值。
+/// **不触碰钥匙串**：已保存与否只看明文标记，凭证值仅在对应账号解锁后才回填。
 #[tauri::command]
 fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
-    let any_unlocked = any_source_unlocked();
+    // 老用户（v0.2.x，凭证按平台存）在启动阶段先把账号元信息补出来，锁定态才不会显示成「未配置」
+    ensure_legacy_account_meta(&app);
+
+    let any_unlocked = any_account_unlocked();
     let path = credentials_path(&app)
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let settings = read_settings(&app);
-    let interval_of = |id: &str| -> u64 {
+    let interval_of = |acc_id: &str| -> u64 {
         settings
             .get("refresh")
-            .and_then(|r| r.get(id))
+            .and_then(|r| r.get(acc_id))
             .and_then(|v| v.as_u64())
             .map(|s| s.clamp(MIN_REFRESH_SECS, MAX_REFRESH_SECS))
             .unwrap_or(DEFAULT_REFRESH_SECS)
     };
+    let accounts = read_accounts(&app);
 
-    let items: Vec<serde_json::Value> = SOURCES
+    let sources: Vec<serde_json::Value> = SOURCES
         .iter()
         .map(|def| {
-            // auto_creds 的源没有可保存的凭证，也不去读钥匙串 / 凭证文件（避免无谓的钥匙串访问）
-            let has_creds = if def.auto_creds {
-                false
-            } else {
-                has_saved_creds(&app, def.id)
-            };
-            // 该源本次运行是否已解锁（可读钥匙串）
-            let src_unlocked = !def.auto_creds && source_unlocked(def.id);
-            // 已保存的值：该源解锁后读钥匙串回填；未解锁只从明文文件读（通常为空）
-            let saved = if def.auto_creds {
-                HashMap::new()
-            } else if src_unlocked {
-                read_source_creds(&app, def.id)
-            } else {
-                read_plaintext_creds(&app, def.id)
-            };
-            // auto_creds 的源（trae）没有可保存的凭证，「已配置」= 本机登录态可读且未过期
-            let auto_info = if def.auto_creds {
-                let probe = trae_probe();
-                Some(serde_json::json!({
-                    "file": probe.storage_path,
-                    "expiredAt": probe.expired_at,
-                    "identity": probe.identity,
-                    "available": probe.unavailable.is_none(),
-                    "unavailable": probe.unavailable,
-                }))
-            } else {
-                None
-            };
-            // 三态：未配置 / 已保存但未解锁 / 已解锁可用
-            let (configured, ready, cred_source) = match &auto_info {
-                Some(info) => {
-                    let ok = info.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
-                    (ok, ok, "auto")
-                }
-                None => {
-                    // configured 只看「是否保存过凭证」（与是否解锁无关，未解锁也要据此显示 tab / 列表项）
-                    (
-                        has_creds,
-                        has_creds && src_unlocked,
-                        if has_creds { "settings" } else { "none" },
-                    )
-                }
-            };
-            let fields: Vec<serde_json::Value> = def
+            // 平台级字段 schema（**不含值**）：新增账号时前端据此生成表单
+            let schema: Vec<serde_json::Value> = def
                 .fields
                 .iter()
                 .map(|f| {
@@ -1651,7 +1848,6 @@ fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
                         "label": f.label,
                         "secret": f.secret,
                         "placeholder": f.placeholder,
-                        "value": saved.get(f.key).cloned().unwrap_or_default(),
                     })
                 })
                 .collect();
@@ -1662,17 +1858,71 @@ fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
                 "helpUrl": def.help_url,
                 "helpText": def.help_text,
                 "note": def.note,
-                "configured": configured,
-                "ready": ready,
-                "unlocked": src_unlocked,
-                "hasCreds": has_creds,
-                "credentialSource": cred_source,
-                "interval": interval_of(def.id),
-                "fields": fields,
                 "autoCreds": def.auto_creds,
+                "fields": schema,
             });
-            if let Some(info) = auto_info {
-                item["autoInfo"] = info;
+
+            if def.auto_creds {
+                // 自动凭证源（trae）：不是真正意义上的账号，用一个固定条目承载它
+                let probe = trae_probe();
+                let ok = probe.unavailable.is_none();
+                item["autoInfo"] = serde_json::json!({
+                    "file": probe.storage_path,
+                    "expiredAt": probe.expired_at,
+                    "identity": probe.identity,
+                    "available": ok,
+                    "unavailable": probe.unavailable,
+                });
+                item["accounts"] = serde_json::json!([{
+                    "id": def.id,
+                    "label": "",
+                    "configured": ok,
+                    "ready": ok,
+                    "unlocked": true,
+                    "hasCreds": false,
+                    "interval": interval_of(def.id),
+                    "fields": [],
+                }]);
+            } else {
+                let list: Vec<serde_json::Value> = accounts
+                    .iter()
+                    .filter(|a| a.source_id == def.id)
+                    .map(|a| {
+                        // 该账号本次运行是否已解锁（解锁后才读钥匙串回填真实值）
+                        let unlocked = account_unlocked(&a.id);
+                        let has_creds = has_saved_creds(&app, &a.id);
+                        let saved = if unlocked {
+                            read_account_creds(&app, &a.id)
+                        } else {
+                            read_plaintext_creds(&app, &a.id)
+                        };
+                        let fields: Vec<serde_json::Value> = def
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "key": f.key,
+                                    "label": f.label,
+                                    "secret": f.secret,
+                                    "placeholder": f.placeholder,
+                                    "value": saved.get(f.key).cloned().unwrap_or_default(),
+                                })
+                            })
+                            .collect();
+                        // 三态：未配置 / 已保存但未解锁 / 已解锁可用
+                        serde_json::json!({
+                            "id": a.id,
+                            "label": a.label,
+                            "configured": has_creds,
+                            "ready": has_creds && unlocked,
+                            "unlocked": unlocked,
+                            "hasCreds": has_creds,
+                            "interval": interval_of(&a.id),
+                            "fields": fields,
+                        })
+                    })
+                    .collect();
+                item["accounts"] = serde_json::Value::Array(list);
             }
             item
         })
@@ -1680,9 +1930,9 @@ fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
 
     serde_json::json!({
         "path": path,
-        "active": active_source_id(&app),
+        "active": active_account_id(&app),
         "unlocked": any_unlocked,
-        // 未解锁任何源时不探测钥匙串可用性（避免触碰 keyring），先按钥匙串假设；解锁后回填真实值
+        // 未解锁任何账号时不探测钥匙串可用性（避免触碰 keyring），先按钥匙串假设；解锁后回填真实值
         "storage": if any_unlocked {
             if keychain_ready() { "keychain" } else { "file" }
         } else {
@@ -1691,33 +1941,36 @@ fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
         "defaultInterval": DEFAULT_REFRESH_SECS,
         "minInterval": MIN_REFRESH_SECS,
         "maxInterval": MAX_REFRESH_SECS,
-        "sources": items,
+        "sources": sources,
     })
 }
 
-/// 设置某个场景的自动刷新间隔（秒），返回夹紧后的实际取值
+/// 设置某个账号的自动刷新间隔（秒），返回夹紧后的实际取值
 #[tauri::command]
 fn set_refresh_interval(
     app: tauri::AppHandle,
-    source_id: String,
+    account_id: String,
     seconds: u64,
 ) -> Result<u64, String> {
-    source_def(&source_id).ok_or_else(|| format!("未支持的数据源: {}", source_id))?;
+    resolve_account(&app, &account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
     let secs = seconds.clamp(MIN_REFRESH_SECS, MAX_REFRESH_SECS);
 
     let mut settings = read_settings(&app);
-    settings["refresh"][source_id.as_str()] = serde_json::json!(secs);
+    settings["refresh"][account_id.as_str()] = serde_json::json!(secs);
     write_settings(&app, &settings)?;
     Ok(secs)
 }
 
-/// 保存某平台的凭证，并把该平台设为当前场景
+/// 保存某平台的账号凭证：`account_id` 为空表示新增账号，否则更新已有账号。
+/// 保存成功后把该账号设为当前，并返回它的账号 id。
 #[tauri::command]
-fn save_source_credentials(
+fn save_account_credentials(
     app: tauri::AppHandle,
     source_id: String,
+    account_id: Option<String>,
+    label: String,
     values: HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let def = source_def(&source_id).ok_or_else(|| format!("未支持的数据源: {}", source_id))?;
 
     if def.auto_creds {
@@ -1733,92 +1986,147 @@ fn save_source_credentials(
         clean.insert(f.key.to_string(), v);
     }
 
-    write_source_creds(&app, def.id, &clean)?;
+    let label = label.trim().to_string();
+    let mut accounts = read_accounts(&app);
+    let editing = account_id.filter(|s| !s.trim().is_empty());
+    let acc_id = match editing {
+        Some(id) => {
+            let Some(acc) = accounts.iter_mut().find(|a| a.id == id && a.source_id == def.id) else {
+                return Err("要修改的账号不存在".to_string());
+            };
+            if !label.is_empty() {
+                acc.label = label;
+            }
+            id
+        }
+        None => {
+            let id = gen_account_id(def.id, &accounts);
+            let label = if label.is_empty() {
+                "默认账号".to_string()
+            } else {
+                label
+            };
+            accounts.push(AccountMeta {
+                id: id.clone(),
+                source_id: def.id.to_string(),
+                label,
+            });
+            id
+        }
+    };
 
-    // 刚写入的源本次运行即可读（无需再走一次「连接账号」）
-    set_source_unlocked(def.id, true);
+    write_account_creds(&app, &acc_id, &clean)?;
 
-    // 凭证本身已进钥匙串 / 凭证文件，配置文件里只留「当前场景」这个非敏感标记
+    // 刚写入的账号本次运行即可读（无需再走一次「连接账号」）
+    set_account_unlocked(&acc_id, true);
+
+    // 账号元信息（仅 id / sourceId / label）落盘
+    write_accounts(&app, &accounts)?;
+
+    // 同步明文标记（仅 id），供锁定态判断「已保存凭证」；写钥匙串本身不弹授权框
+    mark_saved(&app, &acc_id, true)?;
+
+    // 凭证本身已进钥匙串 / 凭证文件，配置文件里只留「当前账号」这个非敏感标记
     let mut store = read_store(&app);
-    store["active"] = serde_json::json!(def.id);
+    store["version"] = serde_json::json!(3);
+    store["active"] = serde_json::json!(acc_id.clone());
     write_store(&app, &store)?;
-
-    // 同步明文标记（仅平台 id），供锁定态判断「已保存凭证」；写钥匙串本身不弹授权框
-    mark_saved(&app, def.id, true)
+    Ok(acc_id)
 }
 
-/// 清除某平台的凭证（只影响该平台，其他平台配置保留）
+/// 删除某个账号（只影响该账号，同平台其他账号与平台配置保留）
 #[tauri::command]
-fn clear_source_credentials(app: tauri::AppHandle, source_id: String) -> Result<(), String> {
-    source_def(&source_id).ok_or_else(|| format!("未支持的数据源: {}", source_id))?;
-    delete_source_creds(&app, &source_id)?;
-    // 该源已无凭证，收回本次运行的解锁态（再切到它的 tab 会重新按需读取）
-    set_source_unlocked(&source_id, false);
-    // 成功删除后从明文标记里移除该平台
-    mark_saved(&app, &source_id, false)
+fn delete_account(app: tauri::AppHandle, account_id: String) -> Result<(), String> {
+    let mut accounts = read_accounts(&app);
+    if !accounts.iter().any(|a| a.id == account_id) {
+        return Err("账号不存在".to_string());
+    }
+    let was_active = active_account_id(&app) == account_id;
+
+    delete_account_creds(&app, &account_id)?;
+    // 该账号已无凭证，收回本次运行的解锁态
+    set_account_unlocked(&account_id, false);
+    mark_saved(&app, &account_id, false)?;
+    accounts.retain(|a| a.id != account_id);
+    write_accounts(&app, &accounts)?;
+
+    // 删的是当前账号时，把当前切到剩下的第一个账号（没有则退回 trae）
+    if was_active {
+        let next = accounts
+            .first()
+            .map(|a| a.id.clone())
+            .unwrap_or_else(|| SOURCES[0].id.to_string());
+        let mut store = read_store(&app);
+        store["version"] = serde_json::json!(3);
+        store["active"] = serde_json::json!(next);
+        write_store(&app, &store)?;
+    }
+    Ok(())
 }
 
 /// 连接账号：把本次会话需要的钥匙串**一次性全部**读进内存。
 ///
-/// 启动阶段不读钥匙串、不弹授权框；用户**第一次**切到某个需要凭证的 tab（或点「连接账号」）时
-/// 才调用这里 —— 它随即把**所有**平台的密钥一起读出来并缓存解锁态。此后切换任何 tab 都直接用
-/// 已缓存的凭证，不再重复弹授权框（「首次触发一次、之后全局免再输」）。
-/// `source_id` 仅用于校验（前端始终传当前 tab），实际执行的是全量解锁。
-/// 返回读到的平台：`{"unlocked": true, "platforms": ["volcengine", ...]}`。
+/// 启动阶段不读钥匙串、不弹授权框；用户**第一次**点「连接账号」（或切到某个需要凭证的账号）时
+/// 才调用这里 —— 它随即把**所有**已保存账号的密钥一起读出来并缓存解锁态。此后切换任何账号都
+/// 直接用已缓存的凭证，不再重复弹授权框（「首次触发一次、之后全局免再输」）。
+/// `account_id` 仅用于校验（前端始终传当前账号），实际执行的是全量解锁。
+/// 返回读到的账号：`{"unlocked": true, "accounts": ["aliyun:1", ...]}`。
 #[tauri::command]
-fn unlock_source(app: tauri::AppHandle, source_id: String) -> Result<serde_json::Value, String> {
-    source_def(&source_id).ok_or_else(|| format!("未支持的数据源: {}", source_id))?;
-    unlock_all_sources(&app)
+fn unlock_accounts(app: tauri::AppHandle, account_id: String) -> Result<serde_json::Value, String> {
+    resolve_account(&app, &account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
+    unlock_all_accounts(&app)
 }
 
-/// 全量解锁：把所有非 auto 数据源的凭证读进内存并置位解锁态。
-/// 每个源只为它自己跑一次性迁移；读不到凭证的源会收回解锁态（前端仍按「未连接」展示）。
-fn unlock_all_sources(app: &tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let mut platforms: Vec<String> = Vec::new();
-    for def in SOURCES.iter().filter(|d| !d.auto_creds) {
-        // 先置位解锁，迁移与读取才能访问钥匙串（此时才可能弹授权框）
-        set_source_unlocked(def.id, true);
-        migrate_legacy_service_for(app, def.id);
-        migrate_source_to_keychain(app, def.id);
+/// 全量解锁：先跑一次性老数据迁移，再把所有已保存账号的凭证读进内存并置位解锁态。
+/// 读不到凭证的账号会收回解锁态（前端仍按「待连接」展示）。
+fn unlock_all_accounts(app: &tauri::AppHandle) -> Result<serde_json::Value, String> {
+    // 老数据迁移必须在这里跑：它要读钥匙串里的旧条目，此时才可能弹授权框
+    migrate_accounts_v3(app);
 
-        // 读该源在钥匙串里的凭证；有则同步「已保存」明文标记（供未解锁时判断）
-        if read_source_creds(app, def.id).is_empty() {
-            set_source_unlocked(def.id, false);
+    let mut ids: Vec<String> = Vec::new();
+    for acc in read_accounts(app) {
+        // 先置位解锁，读取才能访问钥匙串（此时才可能弹授权框）
+        set_account_unlocked(&acc.id, true);
+        if read_account_creds(app, &acc.id).is_empty() {
+            set_account_unlocked(&acc.id, false);
         } else {
-            mark_saved(app, def.id, true)?;
-            platforms.push(def.id.to_string());
+            mark_saved(app, &acc.id, true)?;
+            ids.push(acc.id);
         }
     }
-    Ok(serde_json::json!({ "unlocked": true, "platforms": platforms }))
+    Ok(serde_json::json!({ "unlocked": true, "accounts": ids }))
 }
 
-/// 切换当前展示的场景
+/// 切换当前展示的账号
 #[tauri::command]
-fn set_active_source(app: tauri::AppHandle, source_id: String) -> Result<(), String> {
-    source_def(&source_id).ok_or_else(|| format!("未支持的数据源: {}", source_id))?;
+fn set_active_account(app: tauri::AppHandle, account_id: String) -> Result<(), String> {
+    resolve_account(&app, &account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
     let mut store = read_store(&app);
-    store["version"] = serde_json::json!(2);
-    store["active"] = serde_json::json!(source_id);
+    store["version"] = serde_json::json!(3);
+    store["active"] = serde_json::json!(account_id);
     write_store(&app, &store)
 }
 
-/// 取当前（或指定）场景的数据
+/// 取当前（或指定）账号的数据
 #[tauri::command]
 async fn get_source_data(
     app: tauri::AppHandle,
-    source_id: Option<String>,
+    account_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let id = source_id
+    let acc_id = account_id
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| active_source_id(&app));
-    let def = source_def(&id).ok_or_else(|| format!("未支持的数据源: {}", id))?;
+        .unwrap_or_else(|| active_account_id(&app));
+    let (def, label) = resolve_account(&app, &acc_id)
+        .ok_or_else(|| format!("账号不存在: {}", acc_id))?;
 
-    // 该源未解锁：钥匙串类数据源不取数，返回可被前端识别的「待授权」结构（而非红色报错）
-    if !def.auto_creds && !source_unlocked(&id) {
+    // 该账号未解锁：钥匙串类账号不取数，返回可被前端识别的「待授权」结构（而非红色报错）
+    if !def.auto_creds && !account_unlocked(&acc_id) {
         return Ok(serde_json::json!({
+            "account": acc_id,
             "source": def.id,
             "name": def.name,
+            "label": label,
             "subtitle": def.subtitle,
             "state": "locked",
         }));
@@ -1835,15 +2143,17 @@ async fn get_source_data(
         let raw = fetch_trae_credits(&token).await?;
         trae_payload(raw, &probe)
     } else {
-        let (creds, _) = effective_creds(&app, def).ok_or_else(|| {
+        let (creds, _) = effective_creds(&app, &acc_id, def).ok_or_else(|| {
             format!("尚未配置「{}」的凭证，请点击右上角「设置」填写。", def.name)
         })?;
         fetch_source_raw(def.id, &creds).await?
     };
 
     Ok(serde_json::json!({
+        "account": acc_id,
         "source": def.id,
         "name": def.name,
+        "label": label,
         "subtitle": def.subtitle,
         "data": data,
     }))
@@ -2472,7 +2782,7 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             // 启动阶段零钥匙串访问：两次一次性迁移（明文→钥匙串、遗留服务名迁移）
-            // 已挪到「连接账号」按需解锁流程里执行，见 unlock_source。
+            // 已挪到「连接账号」按需解锁流程里执行，见 unlock_accounts。
 
             // Windows：子类化主窗口过程，为「定住」悬浮窗保留防最小化的能力
             #[cfg(target_os = "windows")]
@@ -2545,13 +2855,13 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_sources,
-            save_source_credentials,
-            clear_source_credentials,
-            set_active_source,
+            save_account_credentials,
+            delete_account,
+            set_active_account,
             set_refresh_interval,
             get_source_data,
             test_source,
-            unlock_source,
+            unlock_accounts,
             open_url,
             set_pinned,
             set_float_width,
@@ -2606,15 +2916,11 @@ mod tests {
         );
     }
 
-    /// 未解锁任何源（默认）：读钥匙串的函数必须直接返回 None，绝不调用 keyring，
+    /// 默认状态下没有任何账号被解锁：读钥匙串的路径都被闸门挡住，
     /// 因此启动过程不会触碰钥匙串、不会弹出 macOS 授权框。
     #[test]
     fn locked_reads_skip_keychain() {
-        assert!(!source_unlocked("deepseek"), "会话解锁集合默认应为空");
-        // 未解锁的源读取「直接返回空」，函数体内不会调用 keyring（否则真机会弹授权框）
-        assert!(
-            read_keychain_creds("deepseek").is_none(),
-            "未解锁的源读钥匙串应返回 None"
-        );
+        assert!(!any_account_unlocked(), "会话解锁集合默认应为空");
+        assert!(!account_unlocked("aliyun:1"), "未解锁的账号应返回 false");
     }
 }

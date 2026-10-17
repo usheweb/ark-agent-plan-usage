@@ -873,6 +873,12 @@ body.pinned .float {
   border: 1px solid rgba(248, 113, 113, 0.32);
 }
 
+.settings-msg.warn {
+  color: #fde68a;
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+}
+
 .modal-foot {
   display: flex;
   align-items: center;
@@ -1008,6 +1014,94 @@ body.pinned .float {
 /* 刷新间隔只是个数字，不必占满整行 */
 #detail-interval {
   max-width: 120px;
+}
+
+/* ---------- 设置：账号列表（同一平台可存多个账号） ---------- */
+
+.account-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 11px;
+  border: 1px solid var(--card-border);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.account-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.account-row-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.account-row-sub {
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.account-row-sub.ok {
+  color: #6ee7b7;
+}
+
+.account-row-sub.warn {
+  color: var(--warn);
+}
+
+.account-cur {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: #061620;
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+}
+
+.account-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+/* 账号行里的按钮要更小一号，才放得下「设为当前 / 编辑 / 删除」 */
+.account-actions .ghost-btn {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.account-add {
+  align-self: flex-start;
+}
+
+#account-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 自动凭证源（Trae）的只读检测信息 */
+#detail-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 /* ---------- 余额类数据源（账户余额场景） ---------- */
