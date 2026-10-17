@@ -1457,14 +1457,15 @@ const NORMAL_MIN_W: f64 = 380.0;
 const NORMAL_MIN_H: f64 = 240.0;
 // 悬浮窗（定住）尺寸
 // 宽度按内容自适应：前端量出卡片「贴合内容」时的宽度后调 set_float_width 收缩窗口，
-// 上限 COMPACT_W（容纳最长文案「近 5 小时剩余 + MM-DD HH:MM 重置」），
+// 上限 COMPACT_W（容纳最长文案，如 Trae「Ultra · 10.0 天（11-14 重置）」、
+// 火山「近 5 小时剩余 + MM-DD HH:MM 重置」；264 会截断 Trae 带天数的副标题），
 // 短内容平台（如 Trae 的积分）就不用再在右侧空出一大片。
 // 高度以内容里最高的元素（52px 的圆环）为基准：卡片竖向留白 = COMPACT_H - 52，
-// 定 70 后上下各约 9px（原 88 是 36px，用户反馈太空，砍掉一半）。
-const COMPACT_W: f64 = 264.0;
-const COMPACT_H: f64 = 70.0;
+// 定 61 后上下各约 4.5px（70 是各 9px，用户要求再减半）。
+const COMPACT_W: f64 = 320.0;
+const COMPACT_H: f64 = 61.0;
 const COMPACT_MIN_W: f64 = 180.0;
-const COMPACT_MIN_H: f64 = 60.0;
+const COMPACT_MIN_H: f64 = 56.0;
 
 // 悬浮窗放大 / 缩小过渡动画：总时长与每帧间隔
 const ANIM_MS: u64 = 180;
@@ -1793,15 +1794,16 @@ fn set_float_width(window: tauri::WebviewWindow, width: f64) -> Result<(), Strin
     Ok(())
 }
 
-/* ---------- 悬浮卡片右键菜单 ---------- */
+/* ---------- 悬浮卡片右键菜单（系统菜单） ---------- */
 
 /// 悬浮卡片右键菜单的两个菜单项 id
 const CARD_MENU_UNPIN: &str = "card-unpin";
 const CARD_MENU_QUIT: &str = "card-quit";
 
 /// 弹出悬浮卡片的右键菜单。菜单由系统绘制，因此可以超出悬浮窗这个极小的窗口边界
-/// （在网页里自绘菜单会被窗口裁掉）。
-/// 「关闭悬浮窗」发回前端走 set_pinned，与卡片上的 × 同一条路径；
+/// （在网页里自绘菜单会被窗口裁掉），贴屏幕边缘时的翻转 / 回收也由系统负责，
+/// 不会出现被屏幕底边裁掉的情况。
+/// 「退出悬浮窗」发回前端走 set_pinned，与卡片上的 × 同一条路径；
 /// 「退出软件」直接退出——退出前会由 run 回调把定住状态与坐标落盘。
 #[tauri::command]
 async fn show_card_menu(window: tauri::WebviewWindow) -> Result<(), String> {
@@ -1982,6 +1984,8 @@ fn main() {
                 }
             }
         })
+        // 右键菜单项点击：「退出悬浮窗」与卡片上的 × 走同一条路径，
+        // 「退出软件」直接退出（退出前由 run 回调落盘定住状态与坐标）
         .on_menu_event(|app, event| match event.id().0.as_str() {
             CARD_MENU_UNPIN => {
                 let _ = app.emit("menu-unpin", ());

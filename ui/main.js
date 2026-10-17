@@ -878,7 +878,8 @@ el.floatCard.addEventListener("click", (e) => {
   else refresh(true);
 });
 
-// 悬浮卡片右键菜单：由 Rust 弹系统原生菜单（网页里自绘会被这么小的窗口裁掉），
+// 悬浮卡片右键菜单：由 Rust 弹系统原生菜单（网页里自绘会被这么小的窗口裁掉，
+// 系统菜单贴屏幕边缘时的翻转也由系统负责），
 // 菜单项「退出悬浮窗」走 menu-unpin 事件回到 setPinned，「退出软件」由 Rust 直接退出。
 // 这里 preventDefault 才不会再弹出 WebView 自带的 Reload 菜单。
 el.floatCard.addEventListener("contextmenu", (e) => {
