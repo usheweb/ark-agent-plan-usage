@@ -3,10 +3,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use hmac::{Hmac, Mac};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use tauri::{Emitter, Manager};
 
@@ -22,6 +23,12 @@ fn sha256_hex(data: &[u8]) -> String {
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC 接受任意长度密钥");
+    mac.update(msg);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hmac_sha1(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC 接受任意长度密钥");
     mac.update(msg);
     mac.finalize().into_bytes().to_vec()
 }
@@ -111,6 +118,8 @@ struct SourceDef {
     /// 凭证由程序自动获取（用户无法填写）：前端隐藏录入表单，只展示只读检测结果。
     /// 目前仅 trae 使用——它从本机 Trae CN 登录态里现场解密，不写钥匙串、不落盘。
     auto_creds: bool,
+    /// 凭证表单下方的额外提示（如「建议用 RAM 子账号 AK」），空串表示不显示
+    note: &'static str,
 }
 
 const VOLC_FIELDS: &[FieldDef] = &[
@@ -135,6 +144,24 @@ const BEARER_FIELDS: &[FieldDef] = &[FieldDef {
     placeholder: "sk-…",
 }];
 
+const ALIYUN_FIELDS: &[FieldDef] = &[
+    FieldDef {
+        key: "accessKey",
+        label: "AccessKey ID",
+        secret: false,
+        placeholder: "LTAI…",
+    },
+    FieldDef {
+        key: "secretKey",
+        label: "AccessKey Secret",
+        secret: true,
+        placeholder: "请填写 AccessKey Secret",
+    },
+];
+
+/// 阿里云凭证表单下的提示：授权范围越细越安全，明确建议只读、别用主账号
+const ALIYUN_NOTE: &str = "建议使用 RAM 子账号创建的 AccessKey，并只授予只读权限：在 RAM 里给这个子账号挂上「费用中心只读」「域名只读」「SSL 证书只读」三类策略即可，本工具只读余额与到期信息。请勿使用主账号 AK，也不要授予任何写权限。";
+
 const SOURCES: &[SourceDef] = &[
     SourceDef {
         id: "trae",
@@ -145,6 +172,7 @@ const SOURCES: &[SourceDef] = &[
         // 无用户可填字段：凭证从本机 Trae CN 登录态自动解密，见 trae_probe
         fields: &[],
         auto_creds: true,
+        note: "",
     },
     SourceDef {
         id: "volcengine",
@@ -154,6 +182,7 @@ const SOURCES: &[SourceDef] = &[
         help_text: "打开火山引擎密钥管理页",
         fields: VOLC_FIELDS,
         auto_creds: false,
+        note: "",
     },
     SourceDef {
         id: "deepseek",
@@ -163,6 +192,7 @@ const SOURCES: &[SourceDef] = &[
         help_text: "打开 DeepSeek 密钥页",
         fields: BEARER_FIELDS,
         auto_creds: false,
+        note: "",
     },
     SourceDef {
         id: "kimi",
@@ -172,6 +202,7 @@ const SOURCES: &[SourceDef] = &[
         help_text: "打开 Kimi 密钥页",
         fields: BEARER_FIELDS,
         auto_creds: false,
+        note: "",
     },
     SourceDef {
         id: "siliconflow",
@@ -181,6 +212,17 @@ const SOURCES: &[SourceDef] = &[
         help_text: "打开硅基流动密钥页",
         fields: BEARER_FIELDS,
         auto_creds: false,
+        note: "",
+    },
+    SourceDef {
+        id: "aliyun",
+        name: "阿里云",
+        subtitle: "余额 · 到期时间",
+        help_url: "https://ram.console.aliyun.com/users",
+        help_text: "打开 RAM 用户管理页",
+        fields: ALIYUN_FIELDS,
+        auto_creds: false,
+        note: ALIYUN_NOTE,
     },
 ];
 
@@ -945,6 +987,11 @@ async fn fetch_source_raw(
             let key = require(creds, "apiKey", "API Key")?;
             http_get_json("https://api.siliconflow.cn/v1/user/info", &key).await
         }
+        "aliyun" => {
+            let ak = require(creds, "accessKey", "AccessKey ID")?;
+            let sk = require(creds, "secretKey", "AccessKey Secret")?;
+            fetch_aliyun_overview(&ak, &sk).await
+        }
         other => Err(format!("未支持的数据源: {}", other)),
     }
 }
@@ -1026,6 +1073,508 @@ async fn fetch_afp_usage(ak: &str, sk: &str) -> Result<serde_json::Value, String
         Some(result) => Ok(result.clone()),
         None => Err(format!("返回异常: {}", text)),
     }
+}
+
+/* ---------- 数据源：阿里云（RPC 风格 1.0 版签名，HMAC-SHA1） ---------- */
+
+// 阿里云的费用中心（BSS）与域名、证书是三套独立的 OpenAPI，各自的域名与版本号都不同，
+// 到期信息也分散在三个接口里，取回后在前端合并成一张按到期时间升序的列表。
+const ALIYUN_BSS_HOST: &str = "business.aliyuncs.com";
+const ALIYUN_BSS_VERSION: &str = "2017-12-14";
+const ALIYUN_DOMAIN_HOST: &str = "domain.aliyuncs.com";
+const ALIYUN_DOMAIN_VERSION: &str = "2018-01-29";
+const ALIYUN_CAS_HOST: &str = "cas.aliyuncs.com";
+const ALIYUN_CAS_VERSION: &str = "2020-04-07";
+/// 每页拉多少条；分页拉全时最多翻 5 页，避免异常响应把请求拖成死循环
+const ALIYUN_PAGE_SIZE: u32 = 300;
+const ALIYUN_MAX_PAGES: u32 = 5;
+
+/// 阿里云签名的 URL 编码：只保留 RFC3986 的非保留字符（字母 / 数字 / - _ . ~），
+/// 其余字节按大写十六进制百分号编码。注意别用 form-urlencoded，它会把空格编成 +。
+fn aliyun_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// 签名用的随机串：微秒时间戳 + 进程内自增序号，保证同一秒内多次请求也不重复
+fn aliyun_nonce() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    format!("{}{}", micros, SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+fn json_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    let mut cur = v;
+    for key in path {
+        cur = cur.get(*key)?;
+    }
+    Some(cur)
+}
+
+/// 调一次阿里云 RPC 接口（GET），自动拼公共参数 + 签名，返回解析后的 JSON。
+/// 接口的业务错误（响应体里带 Code / Message）在这里统一转成 Err。
+async fn aliyun_rpc(
+    ak: &str,
+    sk: &str,
+    endpoint: &str,
+    action: &str,
+    version: &str,
+    extra: &[(&str, String)],
+) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut params: Vec<(String, String)> = vec![
+        ("AccessKeyId".into(), ak.to_string()),
+        ("Action".into(), action.to_string()),
+        ("Format".into(), "JSON".to_string()),
+        ("SignatureMethod".into(), "HMAC-SHA1".to_string()),
+        ("SignatureNonce".into(), aliyun_nonce()),
+        ("SignatureVersion".into(), "1.0".to_string()),
+        ("Timestamp".into(), timestamp),
+        ("Version".into(), version.to_string()),
+    ];
+    for (k, v) in extra {
+        params.push(((*k).to_string(), v.clone()));
+    }
+    // 签名要求：所有参数（含公共参数）按参数名字典序排序后再拼规范查询串
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    let canonical = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", aliyun_encode(k), aliyun_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let string_to_sign = format!("GET&{}&{}", aliyun_encode("/"), aliyun_encode(&canonical));
+    let key = format!("{}&", sk);
+    let signature = base64::engine::general_purpose::STANDARD
+        .encode(hmac_sha1(key.as_bytes(), string_to_sign.as_bytes()));
+
+    let url = format!(
+        "https://{}/?{}&Signature={}",
+        endpoint,
+        canonical,
+        aliyun_encode(&signature)
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取响应失败: {}", e))?;
+    if !status.is_success() {
+        return Err(format!("接口返回 HTTP {}: {}", status.as_u16(), text));
+    }
+    let payload: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析响应失败: {}", e))?;
+    if let Some(code) = payload.get("Code").and_then(|v| v.as_str()) {
+        let msg = payload
+            .get("Message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知原因");
+        return Err(format!("{}（{}）", msg, code));
+    }
+    Ok(payload)
+}
+
+/// 分页拉全：按 size 逐页请求，直到收满 Total 或翻到页数上限。
+/// list_path / total_path 是各接口响应里「列表数组」与「总数」的位置。
+async fn aliyun_fetch_pages(
+    ak: &str,
+    sk: &str,
+    endpoint: &str,
+    action: &str,
+    version: &str,
+    extra: &[(&str, String)],
+    page_param: &str,
+    size_param: &str,
+    list_path: &[&str],
+    total_path: &[&str],
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    for page in 1..=ALIYUN_MAX_PAGES {
+        let mut args: Vec<(&str, String)> = extra.to_vec();
+        args.push((page_param, page.to_string()));
+        args.push((size_param, ALIYUN_PAGE_SIZE.to_string()));
+
+        let payload = aliyun_rpc(ak, sk, endpoint, action, version, &args).await?;
+        let list = json_at(&payload, list_path)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let total = json_at(&payload, total_path)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let got = list.len();
+        all.extend(list);
+        // 收不满一页说明已经是最后一页；总数取不到（字段位置各接口不一致）时
+        // 不把它当成 0 提前收工，靠翻页上限兜底
+        if got < ALIYUN_PAGE_SIZE as usize {
+            break;
+        }
+        if total > 0 && all.len() as u64 >= total {
+            break;
+        }
+    }
+    Ok(all)
+}
+
+/// Unix 毫秒时间戳 -> 统一的 ISO8601 UTC 字符串（前端用本地时区算剩余天数）
+fn aliyun_iso_from_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default()
+}
+
+/// 解析各接口给出的到期时间，统一成 ISO8601 UTC 字符串：
+/// - 实例 / 资源包：已是 `2026-11-14T16:00:00Z`
+/// - 域名：优先用毫秒时间戳字段，字符串兜底（文档未标注时区，按 UTC 处理）
+/// - 证书：订单型是毫秒时间戳，上传型是 `YYYY-MM-DD`
+fn aliyun_norm_date(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Number(n) => aliyun_iso_from_ms(n.as_i64().unwrap_or(0)),
+        serde_json::Value::String(s) => {
+            let raw = s.trim();
+            if raw.is_empty() {
+                return String::new();
+            }
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+                return dt
+                    .with_timezone(&chrono::Utc)
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string();
+            }
+            for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+                if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(raw, fmt) {
+                    return ndt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                }
+            }
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+                return d
+                    .and_hms_opt(0, 0, 0)
+                    .map(|ndt| ndt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_default();
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+/// 到期时间（ISO）-> 剩余天数；解析不了返回 None
+fn aliyun_days_left(iso: &str) -> Option<i64> {
+    let dt = chrono::DateTime::parse_from_rfc3339(iso).ok()?;
+    Some((dt.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_days())
+}
+
+/// 按 ProductCode 给出中文产品名；表里没有的直接回退成大写码本身（至少不会漏项）
+fn aliyun_product_name(code: &str) -> String {
+    let name = match code.to_ascii_lowercase().as_str() {
+        "ecs" => "云服务器 ECS",
+        "rds" => "云数据库 RDS",
+        "polardb" => "云原生数据库 PolarDB",
+        "kvstore" | "redis" => "云数据库 Redis",
+        "mongodb" => "云数据库 MongoDB",
+        "hbase" => "云数据库 HBase",
+        "slb" => "负载均衡 SLB",
+        "vpc" => "专有网络 VPC",
+        "eip" => "弹性公网 IP",
+        "nas" => "文件存储 NAS",
+        "oss" => "对象存储 OSS",
+        "ess" => "弹性伸缩 ESS",
+        "cdn" | "cdns" => "CDN",
+        "ddos" | "ddospro" => "DDoS 防护",
+        "waf" => "Web 应用防火墙",
+        "cas" => "SSL 证书",
+        "dysms" | "sms" => "短信服务",
+        "domain" => "域名",
+        "elasticsearch" => "Elasticsearch",
+        "hologres" => "Hologres",
+        "adb" => "云原生数据仓库 AnalyticDB",
+        "cs" | "csb" => "容器服务",
+        _ => "",
+    };
+    if name.is_empty() {
+        code.to_ascii_uppercase()
+    } else {
+        name.to_string()
+    }
+}
+
+/// 统一的到期条目：产品名 / 资源标识 / 到期时间（ISO UTC）
+fn aliyun_expiring_item(
+    kind: &str,
+    product: &str,
+    name: &str,
+    region: &str,
+    end_time: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "product": product,
+        "name": name,
+        "region": region,
+        "endTime": end_time,
+    })
+}
+
+fn aliyun_str(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn aliyun_str_num(v: &serde_json::Value, key: &str) -> String {
+    match v.get(key) {
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(s)) => s.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 取一张「余额 + 即将到期 + 短信余量」的总览。
+/// 单个接口失败（常见于 RAM 子账号权限没给全）不整体失败：能取到的照常返回，
+/// 失败的记进 warnings 交给前端提示；全都失败才返回 Err。
+async fn fetch_aliyun_overview(
+    ak: &str,
+    sk: &str,
+) -> Result<serde_json::Value, String> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut expiring: Vec<serde_json::Value> = Vec::new();
+    let mut ok_count = 0usize;
+
+    // 1) 账户余额（可选额度和现金余额都给出来，两个口径在控制台里含义不同）
+    let mut balance = serde_json::Value::Null;
+    match aliyun_rpc(
+        ak,
+        sk,
+        ALIYUN_BSS_HOST,
+        "QueryAccountBalance",
+        ALIYUN_BSS_VERSION,
+        &[],
+    )
+    .await
+    {
+        Ok(v) => {
+            ok_count += 1;
+            let data = v.get("Data").cloned().unwrap_or(serde_json::Value::Null);
+            balance = serde_json::json!({
+                "available": aliyun_str_num(&data, "AvailableAmount"),
+                "cash": aliyun_str_num(&data, "AvailableCashAmount"),
+                "currency": aliyun_str(&data, "Currency"),
+            });
+        }
+        Err(e) => warnings.push(format!("账户余额：{}", e)),
+    }
+
+    // 2) 订阅型实例的到期时间（ECS / RDS 等一次拉全，与产品无关）
+    match aliyun_fetch_pages(
+        ak,
+        sk,
+        ALIYUN_BSS_HOST,
+        "QueryAvailableInstances",
+        ALIYUN_BSS_VERSION,
+        &[("SubscriptionType", "Subscription".to_string())],
+        "PageNum",
+        "PageSize",
+        &["Data", "InstanceList"],
+        &["Data", "TotalCount"],
+    )
+    .await
+    {
+        Ok(list) => {
+            ok_count += 1;
+            for it in list {
+                let end_time = aliyun_norm_date(&it["EndTime"]);
+                if end_time.is_empty() {
+                    continue;
+                }
+                let code = aliyun_str(&it, "ProductCode");
+                expiring.push(aliyun_expiring_item(
+                    "instance",
+                    &aliyun_product_name(&code),
+                    &aliyun_str(&it, "InstanceID"),
+                    &aliyun_str(&it, "Region"),
+                    &end_time,
+                ));
+            }
+        }
+        Err(e) => warnings.push(format!("服务器 / 数据库到期：{}", e)),
+    }
+
+    // 3) 域名到期时间（不在上面的实例列表里，要单独查）
+    match aliyun_fetch_pages(
+        ak,
+        sk,
+        ALIYUN_DOMAIN_HOST,
+        "QueryDomainList",
+        ALIYUN_DOMAIN_VERSION,
+        &[],
+        "PageNum",
+        "PageSize",
+        &["Data", "Domain"],
+        // 域名接口的分页字段在顶层，和实例接口（在 Data 里）不一样
+        &["TotalItemNum"],
+    )
+    .await
+    {
+        Ok(list) => {
+            ok_count += 1;
+            for it in list {
+                // 文档里的字符串到期时间带时区歧义，优先用毫秒时间戳字段
+                let end_time = match it.get("ExpirationDateLong") {
+                    Some(v) if !v.is_null() => aliyun_norm_date(v),
+                    _ => aliyun_norm_date(&it["ExpirationDate"]),
+                };
+                if end_time.is_empty() {
+                    continue;
+                }
+                expiring.push(aliyun_expiring_item(
+                    "domain",
+                    "域名",
+                    &aliyun_str(&it, "DomainName"),
+                    "",
+                    &end_time,
+                ));
+            }
+        }
+        Err(e) => warnings.push(format!("域名到期：{}", e)),
+    }
+
+    // 4) SSL 证书到期时间：证书订单与用户上传的证书是两个不同的 OrderType，
+    //    返回的到期字段也各是一套（CertEndTime 毫秒 / EndDate 日期），分别取再合并
+    for (order_type, is_order) in [("CPACK", true), ("CERT", false)] {
+        let res = aliyun_fetch_pages(
+            ak,
+            sk,
+            ALIYUN_CAS_HOST,
+            "ListUserCertificateOrder",
+            ALIYUN_CAS_VERSION,
+            &[("OrderType", order_type.to_string())],
+            "CurrentPage",
+            "ShowSize",
+            &["CertificateOrderList"],
+            &["TotalCount"],
+        )
+        .await;
+        match res {
+            Ok(list) => {
+                ok_count += 1;
+                for it in list {
+                    let end_time = if is_order {
+                        aliyun_norm_date(&it["CertEndTime"])
+                    } else {
+                        aliyun_norm_date(&it["EndDate"])
+                    };
+                    if end_time.is_empty() {
+                        continue;
+                    }
+                    let name = if is_order {
+                        aliyun_str(&it, "Domain")
+                    } else {
+                        aliyun_str(&it, "CommonName")
+                    };
+                    expiring.push(aliyun_expiring_item(
+                        "cert",
+                        "SSL 证书",
+                        &name,
+                        "",
+                        &end_time,
+                    ));
+                }
+            }
+            Err(e) => warnings.push(format!("证书到期：{}", e)),
+        }
+    }
+
+    if ok_count == 0 {
+        return Err(format!(
+            "阿里云接口全部调用失败：{}",
+            warnings.join("；")
+        ));
+    }
+
+    // 只留还没到期的条目，按到期时间升序（最近的排最前，悬浮窗取第一条）
+    expiring.retain(|it| {
+        it.get("endTime")
+            .and_then(|v| v.as_str())
+            .and_then(aliyun_days_left)
+            .map(|d| d >= 0)
+            .unwrap_or(false)
+    });
+    expiring.sort_by_key(|it| {
+        it.get("endTime")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    });
+
+    // 5) 短信套餐余量：官方 FAQ 明确「没有查询套餐包剩余量的 API」，这里用资源包
+    //    接口试取（能不能拿到取决于账号是否被支持），拿不到就整块隐藏、不当成错误
+    let mut sms = serde_json::Value::Null;
+    if let Ok(payload) = aliyun_rpc(
+        ak,
+        sk,
+        ALIYUN_BSS_HOST,
+        "QueryResourcePackageInstances",
+        ALIYUN_BSS_VERSION,
+        &[("PageSize", "100".to_string())],
+    )
+    .await
+    {
+        let list = json_at(&payload, &["Data", "Instances", "Instance"])
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for it in list {
+            let commodity = aliyun_str(&it, "CommodityCode").to_ascii_lowercase();
+            let status = aliyun_str(&it, "Status");
+            if !commodity.contains("sms") || (!status.is_empty() && status != "Available") {
+                continue;
+            }
+            let remaining = aliyun_str_num(&it, "RemainingAmount");
+            if remaining.is_empty() {
+                continue;
+            }
+            sms = serde_json::json!({
+                "remaining": remaining,
+                "total": aliyun_str_num(&it, "TotalAmount"),
+                "unit": aliyun_str(&it, "RemainingAmountUnit"),
+                "endTime": aliyun_norm_date(&it["ExpiryTime"]),
+            });
+            break;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "balance": balance,
+        "expiring": expiring,
+        "sms": sms,
+        "warnings": warnings,
+    }))
 }
 
 /// 平台清单：供设置弹窗渲染「平台列表 + 各平台字段」，并回填已保存的值。
@@ -1112,6 +1661,7 @@ fn list_sources(app: tauri::AppHandle) -> serde_json::Value {
                 "subtitle": def.subtitle,
                 "helpUrl": def.help_url,
                 "helpText": def.help_text,
+                "note": def.note,
                 "configured": configured,
                 "ready": ready,
                 "unlocked": src_unlocked,

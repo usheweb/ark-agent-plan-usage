@@ -699,6 +699,14 @@ function openDetail(id) {
 
       el.detailFields.appendChild(wrap);
     }
+
+    // 平台特定的授权提示（如阿里云建议用 RAM 子账号只读 AK）
+    if (def.note) {
+      const note = document.createElement("div");
+      note.className = "field-note";
+      note.textContent = def.note;
+      el.detailFields.appendChild(note);
+    }
   }
 
   el.detailInterval.value = String(def.interval || defaultInterval);
