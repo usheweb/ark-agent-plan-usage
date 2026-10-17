@@ -96,6 +96,22 @@ function hasRealData(view) {
   return !!view && !!view.html && !/class="empty"/.test(view.html);
 }
 
+/// 取某账号缓存的上一次成功结果，兼容 v0.2.x 时代按「平台 id」存的旧缓存：
+/// 多账号后账号 id 变成 "volcengine:1"，旧 key 却是 "volcengine"，不迁一下就永远对不上。
+function cachedViewFor(id) {
+  if (!id) return null;
+  if (lastGoodViews[id]) return lastGoodViews[id];
+  const srcId = entryById(id)?.source.id || (id.includes(":") ? id.slice(0, id.indexOf(":")) : "");
+  if (srcId && srcId !== id && lastGoodViews[srcId]) {
+    // 顺手把旧 key 搬到账号 id 下，之后走正常路径就能直接命中
+    lastGoodViews[id] = lastGoodViews[srcId];
+    delete lastGoodViews[srcId];
+    saveLastGood();
+    return lastGoodViews[id];
+  }
+  return null;
+}
+
 /// 把某个源上一次的成功结果铺到主视图与悬浮卡上；没有就返回 false
 function applyCachedView(view) {
   if (!view) return false;
@@ -341,7 +357,7 @@ function renderResult(res) {
   }
 
   // 没拿到真实内容：用这个源上一次的成功结果顶替，绝不把已有数据换成空占位
-  if (id && applyCachedView(lastGoodViews[id])) return true;
+  if (applyCachedView(cachedViewFor(id))) return true;
 
   // 这个源一次成功都没有过：保留原有的占位文案
   el.cards.innerHTML =
@@ -431,7 +447,7 @@ async function refresh(manual = false) {
     // 取数失败不显示空占位：回落到这个源上一次的成功结果（本次运行或上次运行存的），
     // 一次都没成功过才给占位文案。错误交给顶部状态与红色横幅表达，提示窗里的
     // 「更新于」停留在上次成功时间，可据此判断数据新旧。
-    if (!applyCachedView(activeAccount && lastGoodViews[activeAccount])) {
+    if (!applyCachedView(cachedViewFor(activeAccount))) {
       el.cards.innerHTML = `<div class="empty">暂无数据</div>`;
       el.badge.textContent = "—";
       lastFloat = null;
