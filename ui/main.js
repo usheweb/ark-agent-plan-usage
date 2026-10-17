@@ -64,6 +64,43 @@ let loading = false;
 /// 当前场景交给悬浮窗的文案；为 null 表示该场景没有可展示的悬浮信息
 let lastFloat = null;
 
+/// 每个数据源「上一次成功渲染的结果」（按源分开存，切 tab 不会串台）。
+/// 取数失败时不把已有的数据换成空占位，改用这里的旧结果顶上；同时落一份到
+/// localStorage，这样冷启动时第一次取数就失败，也还能看到上一次的数据。
+const LAST_GOOD_KEY = "afp:lastGood";
+
+let lastGoodViews = (() => {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LAST_GOOD_KEY) || "{}");
+    return raw && typeof raw === "object" ? raw : {};
+  } catch (_) {
+    return {};
+  }
+})();
+
+function saveLastGood() {
+  try {
+    localStorage.setItem(LAST_GOOD_KEY, JSON.stringify(lastGoodViews));
+  } catch (_) {
+    /* 落盘失败不影响本次展示，内存里这份还在 */
+  }
+}
+
+/// 渲染结果里是否含真实内容：空占位（class="empty"）不算
+function hasRealData(view) {
+  return !!view && !!view.html && !/class="empty"/.test(view.html);
+}
+
+/// 把某个源上一次的成功结果铺到主视图与悬浮卡上；没有就返回 false
+function applyCachedView(view) {
+  if (!view) return false;
+  el.cards.innerHTML = view.html;
+  el.badge.textContent = view.badge || "—";
+  lastFloat = view.float || null;
+  updateFloat();
+  return true;
+}
+
 /// 后端下发的数据源清单，以及当前正在编辑 / 正在展示的平台
 let catalog = [];
 let activeSource = null;
@@ -240,10 +277,12 @@ async function fitWindowHeight(force = false, floor = 0) {
 
 /* ---------- 内容区 ---------- */
 
-/// 数据源的展示交给它自己的渲染模块：ui/sources/<source>.js
+/// 数据源的展示交给它自己的渲染模块：ui/sources/<source>.js。
+/// 返回 true 表示本次没取到真实数据（渲染失败或接口返回空），当前展示的是上一次的结果
 function renderResult(res) {
   lockedScene = false;
-  const mod = (window.AFP_SOURCES || {})[res?.source];
+  const id = res?.source;
+  const mod = (window.AFP_SOURCES || {})[id];
   let view = null;
   try {
     view = mod ? mod.render(res?.data) : null;
@@ -252,18 +291,27 @@ function renderResult(res) {
     console.error(e);
   }
 
-  if (!view) {
-    el.cards.innerHTML = `<div class="empty">这个数据源还没有对应的展示</div>`;
-    el.badge.textContent = "—";
-    lastFloat = null;
-    updateFloat();
-    return;
+  if (hasRealData(view)) {
+    lastGoodViews[id] = {
+      html: view.html,
+      badge: view.badge || "—",
+      float: view.float || null,
+    };
+    saveLastGood();
+    applyCachedView(lastGoodViews[id]);
+    return false;
   }
 
-  el.cards.innerHTML = view.html || `<div class="empty">暂无数据</div>`;
-  el.badge.textContent = view.badge || "—";
-  lastFloat = view.float || null;
+  // 没拿到真实内容：用这个源上一次的成功结果顶替，绝不把已有数据换成空占位
+  if (id && applyCachedView(lastGoodViews[id])) return true;
+
+  // 这个源一次成功都没有过：保留原有的占位文案
+  el.cards.innerHTML =
+    (view && view.html) || `<div class="empty">这个数据源还没有对应的展示</div>`;
+  el.badge.textContent = (view && view.badge) || "—";
+  lastFloat = (view && view.float) || null;
   updateFloat();
+  return false;
 }
 
 /// 锁定态主视图：显示「连接账号」按钮 + 说明，点击后才请求钥匙串授权并加载数据
@@ -324,19 +372,31 @@ async function refresh(manual = false) {
       setStatus("", "待授权");
       renderLocked();
     } else {
-      renderResult(res);
-      hideError();
-      const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-      lastUpdatedAt = now;
-      setStatus("live", `更新于 ${now}`);
+      const stale = renderResult(res);
+      if (stale) {
+        // 接口通了但没返回真实数据：继续展示上一次的结果，只把状态标出来
+        setStatus("err", "显示上次数据");
+        showError("本次没有取到新数据，当前显示的是上一次的结果");
+      } else {
+        hideError();
+        const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+        lastUpdatedAt = now;
+        setStatus("live", `更新于 ${now}`);
+      }
     }
   } catch (e) {
     lockedScene = false;
     setStatus("err", "获取失败");
     showError(String(e));
-    // 刷新失败不清空已有数据：悬浮卡与主视图保留上一次成功的结果，
-    // 错误交给顶部状态与错误横幅表达，避免网络抖一下悬浮窗就变成空「—」卡；
-    // 提示窗里的「更新于」停留在上次成功时间，可据此判断数据新旧
+    // 取数失败不显示空占位：回落到这个源上一次的成功结果（本次运行或上次运行存的），
+    // 一次都没成功过才给占位文案。错误交给顶部状态与红色横幅表达，提示窗里的
+    // 「更新于」停留在上次成功时间，可据此判断数据新旧。
+    if (!applyCachedView(activeSource && lastGoodViews[activeSource])) {
+      el.cards.innerHTML = `<div class="empty">暂无数据</div>`;
+      el.badge.textContent = "—";
+      lastFloat = null;
+      updateFloat();
+    }
   } finally {
     loading = false;
     el.refreshBtn.classList.remove("spinning");
